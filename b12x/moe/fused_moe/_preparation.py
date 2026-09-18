@@ -273,6 +273,18 @@ class _W4A16PrimaryLaunches:
                 "W4A16 execution exceeds its prepared capacity: "
                 f"requested={int(tokens)}, prepared={self.tokens}"
             )
+        native_direct = (
+            int(tokens) == self.tokens
+            and self.route_mode != "packed"
+            and not has_route_map
+            and activation_amax is None
+            and any(
+                launch.topk_ids_dtype == route_ids_dtype
+                for launch in getattr(self.packed, "small_m_direct_launches", ())
+            )
+        )
+        if native_direct:
+            return self.packed, self.topk_sum, None
         direct = (
             int(tokens) == self.tokens
             and self.route_mode != "packed"

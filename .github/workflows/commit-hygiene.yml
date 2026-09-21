@@ -1,0 +1,30 @@
+name: commit-hygiene
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    env:
+      PR_TITLE: ${{ github.event.pull_request.title }}
+      PR_BODY: ${{ github.event.pull_request.body }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Reject AI attribution trailers
+        run: |
+          PATTERN='Co-Authored-By: Claude|Claude-Session:|Generated with \[Claude Code\]|🤖 Generated with'
+          if git log "origin/${{ github.base_ref }}..HEAD" --format=%B \
+              | grep -Eiq "$PATTERN"; then
+            echo "::error::AI attribution trailer found in a commit message"
+            exit 1
+          fi
+          if printf '%s\n%s\n' "$PR_TITLE" "$PR_BODY" | grep -Eiq "$PATTERN"; then
+            echo "::error::AI attribution trailer found in PR title/body"
+            exit 1
+          fi

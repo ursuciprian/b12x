@@ -273,6 +273,12 @@ def validate_moe_decode_config(
         raise ValueError("max_active_clusters must be positive when set")
     if config.route_planner != "triton" and config.max_active_clusters is not None:
         raise ValueError("max_active_clusters requires the Triton route planner")
+    if (
+        config.max_active_clusters is not None
+        and config.route_planner == "triton" and _device is not None
+        and config.max_active_clusters > _device.sm_count
+    ):
+        raise ValueError("NVFP4 grid exceeds the resident SM count")
     if config.backend == "dynamic":
         if config.dynamic_tile_m not in {16, 32, 64, 128}:
             raise ValueError("dynamic_tile_m must be one of 16, 32, 64, 128")
@@ -376,9 +382,12 @@ def _tuning_parameters(query, device):
         tile_n=_LEVEL_TILE_N,
     )[2]
     clamp = min(device.sm_count, tasks)
-    # Grid width is a runtime-only knob: the powers of two up to that clamp,
-    # plus the clamp itself, bracket every resident grid within a factor of two.
-    ladder = sorted({1 << exponent for exponent in range(clamp.bit_length())} | {clamp})
+    # Race partial resident grids without compiling another kernel.
+    ladder = sorted(
+        {1 << exponent for exponent in range(clamp.bit_length())}
+        | {clamp, min(clamp, max(1, device.sm_count // 2)),
+           min(clamp, max(1, 3 * device.sm_count // 4))}
+    )
     return {"max_active_clusters": (None, *ladder)}
 
 
@@ -448,7 +457,7 @@ FC2_TUNING = replace(FC2_TUNING, validate_query=_validate_fc2_query)
 TUNING = TuningContract(
     component_id="moe.decode",
     query_schema_version=8,
-    config_schema_version=4,
+    config_schema_version=5,
     query_fields=frozenset(MoeDecodeQuery.__dataclass_fields__),
     config_fields=frozenset(MoeDecodeConfig.__dataclass_fields__),
     encode_query=MoeDecodeQuery.to_dict,
@@ -457,7 +466,7 @@ TUNING = TuningContract(
     validate_query=_validate_query,
     validate_config=validate_moe_decode_config,
     default_config=_default_config,
-    candidate_contract_version=4,
+    candidate_contract_version=5,
     knobs=(
         Knob(name="backend", values=("micro", "dynamic", "w4a16"), binding=ParameterBinding.COMPILE),
         Knob(name="route_planner", values=("internal", "triton"), binding=ParameterBinding.COMPILE),

@@ -20,7 +20,7 @@ from b12x._lib.compiler import KernelCompileSpec
 from b12x._lib.compiler import compile as b12x_compile
 from b12x._lib.compile_plan import attach_programs
 from b12x._lib.program_cache import register_program_cache
-from b12x._lib.intrinsics import warp_reduce
+from b12x._lib.intrinsics import fma_rn_f32, mul_rn_f32, warp_reduce
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils import current_cuda_stream, make_ptr
 
@@ -48,7 +48,10 @@ _VALUE_TILES = _VALUE_DIM // _VALUE_ROWS_PER_CTA
 _RECORD_DELTA = _KEY_DIM
 _RECORD_DECAY = _KEY_DIM + _VALUE_ROWS_PER_CTA
 _RECORD_FLOATS = (_RECORD_DECAY + 1 + 15) // 16 * 16
-assert _VALUE_TILES * _RECORD_FLOATS <= _VALUE_DIM * _KEY_DIM
+# The live bound -- one slot stride must hold every value head's record block --
+# is checked against the bound tensor in ``_binding_key``, not asserted here
+# over compile-time constants.
+_RECORD_SLOT_FLOATS = _VALUE_TILES * _RECORD_FLOATS
 
 _KERNEL_CACHE: dict[tuple[object, ...], Callable[..., None]] = {}
 _WARMED: set[tuple[object, ...]] = set()
@@ -161,10 +164,15 @@ def _replay_deferred_records(
 ):
     """Advance the base snapshot over the accepted prefix of the last step.
 
-    The two statements below are deliberately shaped like the verify loop's
-    ``state * decay`` followed by ``state + delta * key`` so the same FP32
-    contraction is selected. That is what makes the committed state
-    bit-identical to the checkpoint the verify pass used to persist.
+    The verify loop's update is ``fma(delta, key, rn(state * decay))``: its
+    decayed value has a second use (the ``state_dot_k`` accumulation) so it is
+    materialized, and the ``delta * key`` multiply then has a single use and is
+    contracted into the add. Written as plain arithmetic the replay's decayed
+    value would have one use, and the compiler is free to fold the *left*
+    multiply instead, giving ``fma(state, decay, rn(delta * key))`` -- a
+    different FP32 result. So the contraction is pinned with explicit PTX
+    rather than left to the optimizer's choice. This is the whole bit-identity
+    claim; do not simplify it back to ``a * b + c * d``.
     """
     thread, _, _ = cute.arch.thread_idx()
     thread = Int32(thread)
@@ -189,8 +197,8 @@ def _replay_deferred_records(
             for key_element in cutlass.range_constexpr(_KEYS_PER_THREAD):
                 key_column = key_lane + Int32(key_element * _KEY_LANES_PER_ROW)
                 key_value = Float32(recurrent_state[base + key_column.to(Int64)])
-                state_value = state[key_element] * decay
-                state[key_element] = state_value + delta * key_value
+                state_value = mul_rn_f32(state[key_element], decay)
+                state[key_element] = fma_rn_f32(delta, key_value, state_value)
 
 
 class _GatedRmsNormKernel:
@@ -1350,7 +1358,24 @@ class _CommitDeferredQwenKernel:
                 lane
             ) // Int32(_KEY_LANES_PER_ROW)
             destination_index = destination_indices[request].to(Int64)
-            if destination_index >= Int64(0):
+            # A destination aliasing one of this request's own record columns
+            # would have sibling CTAs writing the committed state into a block
+            # others are still replaying out of, with no grid sync to order
+            # them. The precondition forbids it; this refuses to commit rather
+            # than race, so the failure is a stale state and not nondetermin-
+            # istic corruption.
+            commit_enabled = destination_index >= Int64(0)
+            for relative_token in cutlass.range_constexpr(
+                1, self.state_index_columns
+            ):
+                record_index = state_indices[
+                    request.to(Int64) * state_index_request_stride
+                    + Int64(relative_token) * state_index_column_stride
+                ].to(Int64)
+                commit_enabled = commit_enabled & (
+                    destination_index != record_index
+                )
+            if commit_enabled:
                 source_index = state_indices[
                     request.to(Int64) * state_index_request_stride
                 ].to(Int64)
@@ -1407,6 +1432,14 @@ def _binding_key(binding: Binding) -> tuple[object, ...]:
         1,
     ):
         raise ValueError("recurrent state must be contiguous within each slot")
+    if caps.deferred_checkpoints:
+        record_floats = caps.value_heads * _RECORD_SLOT_FLOATS
+        if int(binding.recurrent_state.stride(0)) < record_floats:
+            raise ValueError(
+                "deferred checkpoints store per-token records inside a state "
+                f"slot; the slot stride must be at least {record_floats} "
+                f"elements, got {int(binding.recurrent_state.stride(0))}"
+            )
     key = (
         binding.output.device.index,
         caps.max_seqs,
@@ -1650,13 +1683,32 @@ def _compile_commit(
 
 
 def precompile_commit_deferred_checkpoints(binding: Binding) -> None:
-    """Compile the commit specialization without mutating runtime tensors."""
+    """Compile and warm-launch the commit without mutating runtime tensors.
+
+    The warm launch passes an all-skip destination vector, so it reads a little
+    metadata and writes nothing. It exists because CUDA module loading must
+    have completed before ``run_commit_deferred_checkpoints`` may be used
+    inside a graph capture, which its capture guard enforces.
+    """
     with torch.cuda.device(binding.output.device):
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 "CuTe GDN compilation is forbidden during CUDA capture"
             )
-        _compile_commit(binding)
+        key, launch = _compile_commit(binding)
+        launch(
+            binding.recurrent_state,
+            binding.num_accepted_tokens,
+            binding.state_indices,
+            torch.full(
+                (int(binding.state_indices.shape[0]),),
+                -1,
+                dtype=torch.int32,
+                device=binding.state_indices.device,
+            ),
+            binding.num_seqs,
+        )
+        _COMMIT_WARMED.add(key)
 
 
 def run_commit_deferred_checkpoints(
@@ -1666,9 +1718,12 @@ def run_commit_deferred_checkpoints(
 
     ``destination_indices`` is an int32 device vector over the bound sequence
     capacity. A negative entry skips that request; an entry equal to
-    ``state_indices[request, 0]`` commits in place. The caller must treat the
-    request's accepted-token count as one afterwards, exactly as vLLM already
-    does after its own block-boundary state copy.
+    ``state_indices[request, 0]`` commits in place. It must **not** equal any of
+    ``state_indices[request, 1:]`` -- those are the request's own record blocks,
+    and the kernel refuses to commit such a request rather than race against
+    the CTAs still replaying out of it. The caller must treat the request's
+    accepted-token count as one afterwards, exactly as vLLM already does after
+    its own block-boundary state copy.
     """
     with torch.cuda.device(binding.output.device):
         key = _commit_key(binding)

@@ -2446,6 +2446,54 @@ def fmax_f32(a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
 
 
 @dsl_user_op
+def fma_rn_f32(
+    a: Float32, b: Float32, c: Float32, *, loc=None, ip=None
+) -> Float32:
+    """Compute ``a * b + c`` as one PTX fma.rn.f32, with the rounding pinned.
+
+    Use this where the *contraction* is part of the contract, not just the
+    value: plain ``a * b + c`` lets the compiler choose which multiply to fuse,
+    so two algebraically identical expressions can round differently. Inline
+    asm is opaque, so neither operand can be contracted into this instruction
+    and neither can this result be contracted into its consumer.
+    """
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [
+                Float32(a).ir_value(loc=loc, ip=ip),
+                Float32(b).ir_value(loc=loc, ip=ip),
+                Float32(c).ir_value(loc=loc, ip=ip),
+            ],
+            "fma.rn.f32 $0, $1, $2, $3;",
+            "=f,f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def mul_rn_f32(a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
+    """Compute ``a * b`` as one PTX mul.rn.f32 that cannot be contracted."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [
+                Float32(a).ir_value(loc=loc, ip=ip),
+                Float32(b).ir_value(loc=loc, ip=ip),
+            ],
+            "mul.rn.f32 $0, $1, $2;",
+            "=f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
 def fabs_f32(a: Float32, *, loc=None, ip=None) -> Float32:
     """Compute absolute value of float32 using PTX abs.f32."""
     return Float32(

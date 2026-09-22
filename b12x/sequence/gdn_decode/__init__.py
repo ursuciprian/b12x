@@ -54,6 +54,14 @@ replays the accepted prefix onto it, and any other reader must call
 ``commit_deferred_checkpoints`` first. It requires Qwen heads, FP32 state, and
 no null state index. See ``docs/gdn-deferred-checkpoints.md``.
 
+**Under this mode the uniqueness of active state-index cells stops being a
+freshness requirement and becomes a correctness one.** A duplicate cell used to
+mean one checkpoint write landing twice; now ``state_indices[r, j] ==
+state_indices[r, 0]`` for any ``j >= 1`` means a record overwriting the base
+state, and the request's state is lost. The slot stride must also be at least
+``value_heads * 4 * 176`` elements so a record block fits inside a slot, which
+binding checks.
+
 ``plan(Caps(...), invocation=...)`` declares immutable geometry and layouts.
 ``invocation_from_tensors`` describes actual parameter dtypes and buffer layouts.
 ``PreparationSession`` resolves and primes the declaration; ``bind`` /
@@ -85,6 +93,7 @@ META = OpMeta(
         "bind_kda_commit",
         "commit_deferred_checkpoints",
         "is_supported",
+        "precompile_deferred_commit",
         "plan",
         "invocation_from_tensors",
         "reference",
@@ -129,6 +138,7 @@ if TYPE_CHECKING:
         bind_kda_commit,
         commit_deferred_checkpoints,
         is_supported,
+        precompile_deferred_commit,
         plan,
         invocation_from_tensors,
         reference,

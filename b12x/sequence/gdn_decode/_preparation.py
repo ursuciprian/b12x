@@ -72,7 +72,8 @@ def _query_from_caps(caps, invocation):
         key_heads=caps.key_heads, value_heads=caps.value_heads,
         max_seqs=caps.max_seqs, max_tokens=caps.max_tokens,
         state_index_columns=caps.state_index_columns, max_state_slots=caps.max_state_slots,
-        null_state_index=caps.null_state_index, **dict(invocation),
+        null_state_index=caps.null_state_index,
+        deferred_checkpoints=caps.deferred_checkpoints, **dict(invocation),
     )
 
 
@@ -84,6 +85,7 @@ def _caps(query, ordinal):
         state_index_columns=query.state_index_columns,
         state_dtype=getattr(torch, query.state_dtype), gate_activation=query.gate_activation,
         qk_l2norm=query.qk_l2norm, null_state_index=query.null_state_index,
+        deferred_checkpoints=query.deferred_checkpoints,
     )
 
 

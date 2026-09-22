@@ -34,6 +34,15 @@ Requests whose selected initial checkpoint is null produce zero output without
 reading or writing recurrent state; null destination cells are not written.
 The default ``None`` leaves every in-range slot, including slot zero, usable.
 
+``Caps.deferred_checkpoints`` (off by default) trades those per-token
+checkpoints for one base checkpoint plus compact per-token records, cutting
+decode state traffic ~2.7x on a kernel that is DRAM bound. Column zero then
+holds the state after the first verified token and the speculative columns hold
+records, so column zero is *not* the current state: the next step's decode
+replays the accepted prefix onto it, and any other reader must call
+``commit_deferred_checkpoints`` first. It requires Qwen heads, FP32 state, and
+no null state index. See ``docs/gdn-deferred-checkpoints.md``.
+
 ``plan(Caps(...), invocation=...)`` declares immutable geometry and layouts.
 ``invocation_from_tensors`` describes actual parameter dtypes and buffer layouts.
 ``PreparationSession`` resolves and primes the declaration; ``bind`` /
@@ -61,6 +70,7 @@ META = OpMeta(
         "Plan",
         "bind",
         "bind_kda",
+        "commit_deferred_checkpoints",
         "is_supported",
         "plan",
         "invocation_from_tensors",
@@ -101,6 +111,7 @@ if TYPE_CHECKING:
         Plan,
         bind,
         bind_kda,
+        commit_deferred_checkpoints,
         is_supported,
         plan,
         invocation_from_tensors,

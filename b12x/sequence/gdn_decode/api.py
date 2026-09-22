@@ -12,6 +12,7 @@ from ._impl import (
     KdaBinding,
     bind,
     bind_kda,
+    commit_deferred_checkpoints,
     run,
     run_kda,
 )
@@ -34,6 +35,7 @@ __all__ = [
     "Plan",
     "bind",
     "bind_kda",
+    "commit_deferred_checkpoints",
     "is_supported",
     "plan",
     "invocation_from_tensors",

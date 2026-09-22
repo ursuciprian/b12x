@@ -85,6 +85,7 @@ def _make_case(
     dt_bias_dtype: torch.dtype = torch.float32,
     norm_dtype: torch.dtype = torch.bfloat16,
     qk_l2norm: bool = True,
+    deferred_checkpoints: bool = False,
 ) -> tuple[gdn.Binding, dict[str, torch.Tensor]]:
     live_seqs = len(query_lengths)
     columns = 4 if columns is None else columns
@@ -105,6 +106,7 @@ def _make_case(
         state_dtype=state_dtype,
         gate_activation=activation,
         qk_l2norm=qk_l2norm,
+        deferred_checkpoints=deferred_checkpoints,
     )
     query_start_loc = torch.full(
         (max_seqs + 1,), live_tokens, dtype=torch.int32, device=device

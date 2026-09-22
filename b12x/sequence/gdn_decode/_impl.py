@@ -55,6 +55,9 @@ class Caps:
     qk_l2norm: bool = True
     null_state_index: int | None = None
     recover_speculative_state: bool = False
+    # Off by default: the shipped recipe keeps writing one full checkpoint per
+    # verified token. See docs/gdn-deferred-checkpoints.md.
+    deferred_checkpoints: bool = False
 
     def __post_init__(self) -> None:
         device = _canonical_device(self.device)
@@ -118,6 +121,22 @@ class Caps:
         object.__setattr__(self, "state_index_columns", columns)
         object.__setattr__(self, "qk_l2norm", bool(self.qk_l2norm))
         object.__setattr__(self, "null_state_index", null_state_index)
+        if type(self.deferred_checkpoints) is not bool:
+            raise TypeError("deferred_checkpoints must be boolean")
+        if self.deferred_checkpoints:
+            if self.key_heads == self.value_heads:
+                raise ValueError(
+                    "deferred checkpoints are Qwen GDN only, not KDA"
+                )
+            if self.state_dtype != torch.float32:
+                raise ValueError(
+                    "deferred checkpoints require an FP32 recurrent state, got "
+                    f"{self.state_dtype}"
+                )
+            if null_state_index is not None:
+                raise ValueError(
+                    "deferred checkpoints require null_state_index=None"
+                )
 
     @property
     def value_heads_per_key_head(self) -> int:
@@ -845,6 +864,12 @@ def run(
     state-index column. A one-column plan with one token per request is ordinary
     decode.
 
+    Under ``Caps.deferred_checkpoints`` the initial checkpoint instead comes
+    from column zero with the accepted prefix replayed onto it from the records
+    in columns ``1 .. accepted - 1``, and only column zero receives a full
+    checkpoint; the remaining columns receive records. See
+    ``commit_deferred_checkpoints`` and ``docs/gdn-deferred-checkpoints.md``.
+
     Packed metadata is trusted: counts, sequence bounds, accepted-token counts,
     and state slots must be valid, and active state-index cells must be unique.
     If configured, a null initial checkpoint zeroes that request's output
@@ -885,6 +910,41 @@ def run(
         plan=binding.plan,
     )
     return binding.output
+
+
+def commit_deferred_checkpoints(
+    binding: Binding, destination_indices: torch.Tensor
+) -> None:
+    """Materialize the accepted-prefix state of a deferred-checkpoint plan.
+
+    With ``Caps.deferred_checkpoints`` the decode kernel leaves the base
+    snapshot in state-index column zero and the per-token records in the
+    speculative columns, so column zero is *not* the current state. Any reader
+    outside the decode step calls this first. ``destination_indices`` is an
+    int32 device vector over the bound sequence capacity: a negative entry
+    skips that request, and an entry equal to ``state_indices[request, 0]``
+    commits in place. The caller must then treat the request's accepted-token
+    count as one, exactly as it already does after its own state copy.
+    """
+    if not isinstance(binding, Binding):
+        raise TypeError(f"binding must be Binding, got {type(binding)!r}")
+    if binding.plan is None:
+        raise TypeError("the GDN commit requires a session-prepared binding")
+    caps = binding._state.caps
+    if not caps.deferred_checkpoints:
+        raise ValueError(
+            "the GDN commit requires Caps(deferred_checkpoints=True)"
+        )
+    _require_tensor(
+        "destination_indices",
+        destination_indices,
+        shape=(int(binding.state_indices.shape[0]),),
+        device=caps.device,
+        dtypes=(torch.int32,),
+    )
+    from ._cute_kernels import run_commit_deferred_checkpoints
+
+    run_commit_deferred_checkpoints(binding, destination_indices)
 
 
 def run_kda(
@@ -949,6 +1009,7 @@ __all__ = [
     "KdaBinding",
     "bind",
     "bind_kda",
+    "commit_deferred_checkpoints",
     "run",
     "run_kda",
 ]

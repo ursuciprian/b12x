@@ -912,6 +912,24 @@ def run(
     return binding.output
 
 
+def precompile_deferred_commit(binding: Binding) -> None:
+    """Compile and warm-launch the commit so it is usable inside a capture.
+
+    Writes nothing: the warm launch skips every request. Call it once per
+    binding, on a normal stream, before any CUDA graph capture that will call
+    :func:`commit_deferred_checkpoints`.
+    """
+    if not isinstance(binding, Binding):
+        raise TypeError(f"binding must be Binding, got {type(binding)!r}")
+    if not binding._state.caps.deferred_checkpoints:
+        raise ValueError(
+            "the GDN commit requires Caps(deferred_checkpoints=True)"
+        )
+    from ._cute_kernels import precompile_commit_deferred_checkpoints
+
+    precompile_commit_deferred_checkpoints(binding)
+
+
 def commit_deferred_checkpoints(
     binding: Binding, destination_indices: torch.Tensor
 ) -> None:
@@ -923,8 +941,10 @@ def commit_deferred_checkpoints(
     outside the decode step calls this first. ``destination_indices`` is an
     int32 device vector over the bound sequence capacity: a negative entry
     skips that request, and an entry equal to ``state_indices[request, 0]``
-    commits in place. The caller must then treat the request's accepted-token
-    count as one, exactly as it already does after its own state copy.
+    commits in place. It must not equal any of ``state_indices[request, 1:]``,
+    which hold that request's records; such a request is refused, not
+    committed. The caller must then treat the request's accepted-token count as
+    one, exactly as it already does after its own state copy.
     """
     if not isinstance(binding, Binding):
         raise TypeError(f"binding must be Binding, got {type(binding)!r}")
@@ -1010,6 +1030,7 @@ __all__ = [
     "bind",
     "bind_kda",
     "commit_deferred_checkpoints",
+    "precompile_deferred_commit",
     "run",
     "run_kda",
 ]

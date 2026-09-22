@@ -26,12 +26,12 @@ def _prepared_case_lifetime():
             _case_resources.reset(token)
 
 
-def _prepare(caps, tensors, *, restore_state=None):
+def _prepare(caps, tensors, *, restore_state=None, override=None):
     original_output = tensors["output"].clone()
     if restore_state is None:
         original_state = tensors["recurrent_state"].clone()
         restore_state = lambda: tensors["recurrent_state"].copy_(original_state)
-    declaration = gdn.plan(caps, invocation=gdn.invocation_from_tensors(caps, **tensors))
+    declaration = gdn.plan(caps, invocation=gdn.invocation_from_tensors(caps, **tensors), override=override)
 
     def restore():
         restore_state()
@@ -79,6 +79,7 @@ def _make_case(
     value_heads: int = 24,
     columns: int | None = None,
     accepted: tuple[int, ...] | None = None,
+    head_group_size: int = 0,
     activation: str = "sigmoid",
     state_dtype: torch.dtype = torch.float32,
     a_log_dtype: torch.dtype = torch.float32,
@@ -153,7 +154,10 @@ def _make_case(
             device=device,
         ),
     }
-    binding = _prepare(caps, tensors)
+    binding = _prepare(caps, tensors, override=gdn.GdnConfig(
+        backend="cutedsl", recurrent_block_v=32,
+        qwen_head_group_size=head_group_size,
+    ))
     return binding, tensors
 
 
@@ -1023,7 +1027,8 @@ def test_torch_compile_fullgraph_keeps_outer_op_opaque() -> None:
     )
 
 
-def test_qwen_grouped_state_slot_offset_past_int32_boundary() -> None:
+@pytest.mark.parametrize("head_group_size", [0, 1, 2, 3])
+def test_qwen_grouped_state_slot_offset_past_int32_boundary(head_group_size) -> None:
     device = require_sm120()
     key_heads, value_heads = 8, 24
     slot_elements = value_heads * 128 * 128
@@ -1094,6 +1099,8 @@ def test_qwen_grouped_state_slot_offset_past_int32_boundary() -> None:
     binding = _prepare(
         caps, tensors,
         restore_state=lambda: recurrent_state[tail_slot : tail_slot + 1].copy_(compact_reference_state),
+        override=gdn.GdnConfig(backend="cutedsl", recurrent_block_v=32,
+                               qwen_head_group_size=head_group_size),
     )
     expected = gdn.reference.decode(
         mixed_qkv,

@@ -29,6 +29,7 @@ def test_benchmark_suite_covers_sharded_qwen_head_geometries() -> None:
         "qk8-v24-spec4-bs1",
         "qk8-v24-spec4-uneven",
         "qk8-v24-spec4-bs4",
+        *(f"qk8-v24-verify5-bs{c}" for c in (1, 4, 8, 10, 16)),
         "qk4-v12-decode-bs1",
         "qk2-v6-decode-bs1",
     }

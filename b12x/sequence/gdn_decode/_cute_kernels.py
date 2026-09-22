@@ -38,7 +38,6 @@ _WARPS_PER_CTA = _THREADS // 32
 _NORM_THREADS = 256
 _NORM_WARPS_PER_CTA = _NORM_THREADS // 32
 _NORM_MAX_CTAS = 192
-_GROUPED_VALUE_HEADS = 2
 
 _KERNEL_CACHE: dict[tuple[object, ...], Callable[..., None]] = {}
 _WARMED: set[tuple[object, ...]] = set()
@@ -227,6 +226,7 @@ class _PackedRecurrentQwenKernel:
         qk_l2norm: bool,
         null_state_index: int | None,
         state_type: type[cutlass.Numeric],
+        head_group_size: int = 0,
     ) -> None:
         self.max_seqs = int(max_seqs)
         self.state_index_columns = int(state_index_columns)
@@ -235,9 +235,20 @@ class _PackedRecurrentQwenKernel:
         self.head_ratio = self.value_heads // self.key_heads
         if self.head_ratio != 3:
             raise ValueError("CuTe Qwen GDN requires three value heads per key head")
+        if type(head_group_size) is not int or head_group_size not in (0, 1, 2, 3):
+            raise ValueError("Qwen head_group_size must be 0, 1, 2 or 3")
+        self.head_group_size = head_group_size
+        self.grouped_value_heads = head_group_size if head_group_size > 1 else 2
+        self.groups_per_key = (
+            self.head_ratio + self.grouped_value_heads - 1
+        ) // self.grouped_value_heads
+        self.work_heads = (
+            self.key_heads * self.groups_per_key
+            if head_group_size > 1 else self.value_heads
+        )
         self.work_ctas = min(
             _MAX_WORK_CTAS,
-            self.max_seqs * self.value_heads * (_VALUE_DIM // _VALUE_ROWS_PER_CTA),
+            self.max_seqs * self.work_heads * (_VALUE_DIM // _VALUE_ROWS_PER_CTA),
         )
         self.packed_qkv_width = (
             2 * self.key_heads * _KEY_DIM + self.value_heads * _VALUE_DIM
@@ -582,19 +593,19 @@ class _PackedRecurrentQwenKernel:
         shared_params = allocator.allocate_tensor(
             element_type=Float32,
             layout=cute.make_layout(
-                (_GROUPED_VALUE_HEADS * self.state_index_columns * 2,),
+                (self.grouped_value_heads * self.state_index_columns * 2,),
                 stride=(1,),
             ),
             byte_alignment=16,
         )
 
-        a_log_scales = cute.make_rmem_tensor((_GROUPED_VALUE_HEADS,), Float32)
-        dt_bias_values = cute.make_rmem_tensor((_GROUPED_VALUE_HEADS,), Float32)
-        for value_head_offset in cutlass.range_constexpr(_GROUPED_VALUE_HEADS):
+        a_log_scales = cute.make_rmem_tensor((self.grouped_value_heads,), Float32)
+        dt_bias_values = cute.make_rmem_tensor((self.grouped_value_heads,), Float32)
+        for value_head_offset in cutlass.range_constexpr(self.grouped_value_heads):
             a_log_scales[value_head_offset] = Float32(0.0)
             dt_bias_values[value_head_offset] = Float32(0.0)
         if thread == Int32(0):
-            for value_head_offset in cutlass.range_constexpr(_GROUPED_VALUE_HEADS):
+            for value_head_offset in cutlass.range_constexpr(self.grouped_value_heads):
                 value_head = key_head * Int32(self.head_ratio) + Int32(
                     value_head_offset
                 )
@@ -656,7 +667,7 @@ class _PackedRecurrentQwenKernel:
 
                 if thread == Int32(0):
                     for value_head_offset in cutlass.range_constexpr(
-                        _GROUPED_VALUE_HEADS
+                        self.grouped_value_heads
                     ):
                         value_head = key_head * Int32(self.head_ratio) + Int32(
                             value_head_offset
@@ -695,7 +706,7 @@ class _PackedRecurrentQwenKernel:
 
         cute.arch.sync_threads()
 
-        for value_head_offset in cutlass.range(Int32(_GROUPED_VALUE_HEADS), unroll=1):
+        for value_head_offset in cutlass.range(Int32(self.grouped_value_heads), unroll=1):
             value_head = key_head * Int32(self.head_ratio) + value_head_offset
             # All pool-scaled products are widened before multiplication.
             state_base = (
@@ -830,7 +841,7 @@ class _PackedRecurrentQwenKernel:
             Int32(0), cutlass.min(live_seqs, Int32(self.max_seqs))
         )
         value_tiles = Int32(_VALUE_DIM // _VALUE_ROWS_PER_CTA)
-        total_work = bounded_seqs * Int32(self.value_heads) * value_tiles
+        total_work = bounded_seqs * Int32(self.work_heads) * value_tiles
         work_iterations = cutlass.max(
             Int32(0),
             (total_work - work_block + Int32(self.work_ctas - 1))
@@ -840,9 +851,20 @@ class _PackedRecurrentQwenKernel:
             work = work_block + work_iteration * Int32(self.work_ctas)
             value_tile = work % value_tiles
             request_value_head = work // value_tiles
-            value_head = request_value_head % Int32(self.value_heads)
-            request = request_value_head // Int32(self.value_heads)
-            key_head = value_head // Int32(self.head_ratio)
+            work_head = request_value_head % Int32(self.work_heads)
+            request = request_value_head // Int32(self.work_heads)
+            if cutlass.const_expr(self.head_group_size > 1):
+                # Compact work IDs: pairs launch one pair plus its tail;
+                # triples launch one CTA per key head. No follower CTAs.
+                key_head = work_head // Int32(self.groups_per_key)
+                value_head = (
+                    key_head * Int32(self.head_ratio)
+                    + (work_head % Int32(self.groups_per_key))
+                    * Int32(self.grouped_value_heads)
+                )
+            else:
+                value_head = work_head
+                key_head = value_head // Int32(self.head_ratio)
             value_row = value_tile * Int32(_VALUE_ROWS_PER_CTA) + Int32(
                 lane
             ) // Int32(_KEY_LANES_PER_ROW)
@@ -855,10 +877,13 @@ class _PackedRecurrentQwenKernel:
                     + accepted_column.to(Int64) * state_index_column_stride
                 )
                 source_index = state_indices[source_index_offset].to(Int64)
-                grouped_heads = (end - start > Int32(1)) & (bounded_seqs > Int32(1))
+                if cutlass.const_expr(self.head_group_size == 0):
+                    grouped_heads = (end - start > Int32(1)) & (bounded_seqs > Int32(1))
+                else:
+                    grouped_heads = Int32(self.head_group_size) > Int32(1)
                 value_head_in_group = value_head % Int32(self.head_ratio)
                 group_leader = value_head_in_group == Int32(0)
-                ungrouped_tail = value_head_in_group == Int32(_GROUPED_VALUE_HEADS)
+                ungrouped_tail = value_head_in_group == Int32(self.grouped_value_heads)
                 if cutlass.const_expr(self.has_null_state_index):
                     if source_index == Int64(self.null_state_index):
                         if Int32(lane) % Int32(_KEY_LANES_PER_ROW) == Int32(0):
@@ -867,7 +892,7 @@ class _PackedRecurrentQwenKernel:
                                     for (
                                         value_head_offset
                                     ) in cutlass.range_constexpr(
-                                        _GROUPED_VALUE_HEADS
+                                        self.grouped_value_heads
                                     ):
                                         self._zero_request(
                                             output,
@@ -1079,6 +1104,7 @@ def _binding_key(binding: Binding) -> tuple[object, ...]:
         binding.state_indices.dtype,
         binding.A_log.dtype,
         binding.dt_bias.dtype,
+        binding._state.config.qwen_head_group_size,
     )
 
 
@@ -1101,6 +1127,7 @@ def _compile(binding: Binding) -> tuple[tuple[object, ...], Callable[..., None]]
         qk_l2norm=caps.qk_l2norm,
         null_state_index=caps.null_state_index,
         state_type=state_type,
+        head_group_size=binding._state.config.qwen_head_group_size,
     )
     raise_if_kernel_resolution_frozen(
         "cute.compile",
@@ -1140,7 +1167,7 @@ def _compile(binding: Binding) -> tuple[tuple[object, ...], Callable[..., None]]
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "sequence.gdn_decode.packed_recurrent_qwen",
-            3,
+            4,
             key,
         ),
     )

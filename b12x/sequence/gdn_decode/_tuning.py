@@ -84,13 +84,16 @@ class GdnQuery:
 class GdnConfig:
     backend: str
     recurrent_block_v: int
+    # 0 preserves the original runtime pair/tail dispatch; 1/2/3 use
+    # independent heads or compact pairs/triples. This is planned geometry.
+    qwen_head_group_size: int = 0
 
     @classmethod
     def from_config(cls, payload: FrozenMapping) -> "GdnConfig":
-        expected = {"backend", "recurrent_block_v"}
+        expected = {"backend", "recurrent_block_v", "qwen_head_group_size"}
         if set(payload) != expected:
             raise ValueError(
-                "GDN configs require exactly backend and recurrent_block_v"
+                "GDN configs require backend, recurrent_block_v and qwen_head_group_size"
             )
         backend = payload["backend"]
         if not isinstance(backend, str):
@@ -100,9 +103,13 @@ class GdnConfig:
             recurrent_block_v, bool
         ):
             raise TypeError("GDN recurrent_block_v must be an integer")
+        group_size = payload["qwen_head_group_size"]
+        if type(group_size) is not int:
+            raise TypeError("GDN qwen_head_group_size must be an integer")
         return cls(
             backend=backend,
             recurrent_block_v=recurrent_block_v,
+            qwen_head_group_size=group_size,
         )
 
 
@@ -178,12 +185,22 @@ def _validate_config(
         )
     if query.key_heads != query.value_heads and config.recurrent_block_v != 32:
         raise ValueError("Qwen GDN requires recurrent_block_v=32")
+    if type(config.qwen_head_group_size) is not int:
+        raise TypeError("GDN qwen_head_group_size must be an integer")
+    if config.qwen_head_group_size not in (0, 1, 2, 3):
+        raise ValueError("GDN qwen_head_group_size must be 0, 1, 2 or 3")
+    if query.key_heads == query.value_heads and config.qwen_head_group_size != 0:
+        raise ValueError("KDA does not use Qwen head grouping")
 
 
 def _tuning_parameters(query: GdnQuery, device):
     del device
-    # Production dispatch is fixed by the equal-head KDA / grouped-head GDN recipe.
-    return {"backend": ("triton" if query.key_heads == query.value_heads else "cutedsl",)}
+    kda = query.key_heads == query.value_heads
+    return {
+        "backend": ("triton" if kda else "cutedsl",),
+        # Grouped variants did not improve c8-c16; explicit research overrides only.
+        "qwen_head_group_size": (0,),
+    }
 
 
 # The state slot count sizes the caller's pool; it does not change which
@@ -198,9 +215,9 @@ def _encode_query(query: GdnQuery) -> dict[str, object]:
 TUNING = TuningContract(
     component_id="attention.gdn",
     query_schema_version=4,
-    config_schema_version=4,
+    config_schema_version=5,
     query_fields=_KEY_FIELDS,
-    config_fields=frozenset({"backend", "recurrent_block_v"}),
+    config_fields=frozenset({"backend", "recurrent_block_v", "qwen_head_group_size"}),
     encode_query=_encode_query,
     encode_config=asdict,
     decode_config=GdnConfig.from_config,
@@ -210,8 +227,9 @@ TUNING = TuningContract(
     knobs=(
         Knob(name="backend", values=None, binding=ParameterBinding.COMPILE),
         Knob(name="recurrent_block_v", values=(16, 32), binding=ParameterBinding.COMPILE),
+        Knob(name="qwen_head_group_size", values=None, binding=ParameterBinding.COMPILE),
     ),
-    candidate_contract_version=3,
+    candidate_contract_version=5,
     parameters=_tuning_parameters,
 )
 

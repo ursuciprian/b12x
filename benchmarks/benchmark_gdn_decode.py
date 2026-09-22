@@ -62,6 +62,9 @@ QWEN38_GDN_CASES = (
     BenchmarkCase("qk8-v24-spec4-bs1", (4,), 8, 24),
     BenchmarkCase("qk8-v24-spec4-uneven", (4, 2, 1, 3), 8, 24),
     BenchmarkCase("qk8-v24-spec4-bs4", (4, 4, 4, 4), 8, 24),
+    # Four MTP proposals verify five tokens including the target token.
+    *(BenchmarkCase(f"qk8-v24-verify5-bs{c}", (5,) * c, 8, 24)
+      for c in (1, 4, 8, 10, 16)),
     BenchmarkCase("qk4-v12-decode-bs1", (1,), 4, 12),
     BenchmarkCase("qk2-v6-decode-bs1", (1,), 2, 6),
 )
@@ -144,6 +147,7 @@ def build_case(
     seed: int,
     capacity_seqs: int | None = None,
     capacity_columns: int | None = None,
+    head_group_size: int = 0,
 ) -> CaseBuffers:
     if case.value_heads != 3 * case.key_heads:
         raise ValueError(f"Qwen GDN requires value_heads=3*key_heads: {case}")
@@ -168,8 +172,6 @@ def build_case(
         gate_activation="sigmoid",
         qk_l2norm=True,
     )
-    planned = gdn.plan(caps)
-    (scratch_spec,) = planned.scratch_specs()
     query_start_loc = torch.full(
         (max_seqs + 1,), live_tokens, dtype=torch.int32, device=device
     )
@@ -181,9 +183,6 @@ def build_case(
         max_seqs * columns, dtype=torch.int32, device=device
     ).view(max_seqs, columns)
     tensors = {
-        "scratch": torch.empty(
-            scratch_spec.shape, dtype=scratch_spec.dtype, device=device
-        ),
         "mixed_qkv": _randn(
             (max_tokens, caps.packed_qkv_width),
             device=device,
@@ -241,13 +240,22 @@ def build_case(
             device=device,
         ),
     }
+    planned = gdn.plan(
+        caps, invocation=gdn.invocation_from_tensors(caps, **tensors),
+        override=gdn.GdnConfig(
+            backend="cutedsl", recurrent_block_v=32,
+            qwen_head_group_size=head_group_size,
+        ),
+    )
+    (scratch_spec,) = planned.scratch_specs()
+    tensors["scratch"] = torch.empty(scratch_spec.shape, dtype=scratch_spec.dtype, device=device)
     binding = gdn.bind(planned, **tensors)
     return CaseBuffers(binding=binding, initial_state=binding.recurrent_state.clone())
 
 
 def _reference(buffers: CaseBuffers) -> tuple[torch.Tensor, torch.Tensor]:
     binding = buffers.binding
-    caps = binding.plan.caps
+    caps = binding._state.caps
     state = buffers.initial_state.clone()
     output = gdn.reference.decode(
         binding.mixed_qkv,
@@ -431,6 +439,7 @@ def benchmark_case(
     l2_flush,
     capacity_seqs: int | None = None,
     capacity_columns: int | None = None,
+    head_group_size: int = 0,
 ) -> CaseReport:
     buffers = build_case(
         case,
@@ -438,6 +447,7 @@ def benchmark_case(
         seed=seed,
         capacity_seqs=capacity_seqs,
         capacity_columns=capacity_columns,
+        head_group_size=head_group_size,
     )
     correctness = check_correctness(buffers)
     eager = (
@@ -571,6 +581,8 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         help="planned state-index columns; defaults to at least 4",
     )
+    parser.add_argument("--head-group-size", type=int, choices=(0, 1, 2, 3), default=0,
+                        help="0: legacy; 1: independent heads; 2: compact pairs; 3: compact triples")
     parser.add_argument("--json", type=pathlib.Path)
     args = parser.parse_args(argv)
     if args.warmup < 1 or args.iterations < 1:
@@ -616,6 +628,7 @@ def main(argv: list[str] | None = None) -> int:
         "torch_cuda_version": torch.version.cuda,
         "timed_path": "b12x.sequence.gdn_decode public Qwen decode transaction",
         "recurrence_backend": "cutedsl",
+        "head_group_size": args.head_group_size,
         "triton_role": "gated_rmsnorm_auxiliary",
         "reference_timed": False,
         "metric_direction": "lower_is_better",
@@ -643,6 +656,7 @@ def main(argv: list[str] | None = None) -> int:
             l2_flush=l2_flush,
             capacity_seqs=args.capacity_seqs,
             capacity_columns=args.capacity_columns,
+            head_group_size=args.head_group_size,
         )
         reports.append(report)
         print(

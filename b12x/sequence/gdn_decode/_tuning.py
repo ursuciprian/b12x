@@ -52,6 +52,7 @@ class GdnQuery:
     dt_bias_dtype: str | None = None
     norm_weight_dtype: str = "bfloat16"
     state_indices_dtype: str = "int32"
+    deferred_checkpoints: bool = False
     kda_strides: tuple[int, ...] | None = None
     pointer_alignments: FrozenMapping | None = None
     recover_speculative_state: bool = False
@@ -149,6 +150,17 @@ def _validate_query(query: GdnQuery, _device: DeviceIdentity | None) -> None:
         raise ValueError("unsupported GDN state or parameter dtype")
     if query.state_indices_dtype not in ("int32", "int64"):
         raise ValueError("GDN state indices require int32 or int64")
+    if type(query.deferred_checkpoints) is not bool:
+        raise TypeError("deferred_checkpoints must be boolean")
+    if query.deferred_checkpoints and (
+        kda
+        or query.state_dtype != "float32"
+        or query.null_state_index is not None
+    ):
+        raise ValueError(
+            "deferred GDN checkpoints require Qwen heads, FP32 state, and no "
+            "null state index"
+        )
     if query.null_state_index is not None and (
         type(query.null_state_index) is not int or not -(1 << 63) <= query.null_state_index < (1 << 63)
     ):
@@ -198,8 +210,17 @@ def _tuning_parameters(query: GdnQuery, device):
 
 
 # The state slot count sizes the caller's pool; it does not change which
-# configuration is fastest, so it stays out of the selection key.
-_KEY_FIELDS = frozenset(GdnQuery.__dataclass_fields__) - {"max_state_slots"}
+# configuration is fastest, so it stays out of the selection key. Deferred
+# checkpoints are the same kind of knob: the candidate space is a single point
+# either way, and the compiled-program identity already carries the flag
+# (``_cute_kernels._binding_key``). Keeping both out of the key is what lets
+# this land without bumping ``query_schema_version`` /
+# ``config_schema_version``, so no persisted selection for
+# ``sequence.gdn_decode`` misses on the next boot.
+_KEY_FIELDS = frozenset(GdnQuery.__dataclass_fields__) - {
+    "max_state_slots",
+    "deferred_checkpoints",
+}
 
 
 def _encode_query(query: GdnQuery) -> dict[str, object]:

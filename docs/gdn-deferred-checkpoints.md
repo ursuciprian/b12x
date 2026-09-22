@@ -1,8 +1,9 @@
 # Deferred GDN decode checkpoints
 
 Status: implemented in b12x behind `Caps(deferred_checkpoints=True)`, **default
-off**. Not yet enabled in the vLLM fork; §vLLM is a patch sketch, not applied.
-Branch `feat/gdn-deferred-checkpoints`, from `a8333658`.
+off**, branch `feat/gdn-deferred-checkpoints` from `a8333658`. The vLLM side is
+implemented too (§6) but not enabled anywhere: it needs a b12x wheel carrying
+this branch, and no published wheel has one. Nothing is measured yet.
 
 ## 1. Why
 
@@ -118,6 +119,13 @@ GDN traffic ever matters.`
 | `state_indices`, `num_accepted_tokens`, `num_seqs`, `query_start_loc` | caller | per step | unchanged |
 | scratch | caller | per call | still 0 bytes |
 
+Two preconditions the shipped path tolerated and this one does not. **Active
+state-index cells must be unique**: a duplicate used to mean a checkpoint
+written twice, and now means a record overwriting the base state. And the
+**slot stride must hold a record block** (`value_heads * 4 * 176` elements),
+which `_binding_key` checks against the bound tensor rather than asserting over
+compile-time constants.
+
 **Accepted length arrives as a device tensor**, `num_accepted_tokens`
 (`int32[max_seqs]`), which the kernel already reads to pick its source column.
 On the vLLM side the post-sampler value is device-only —
@@ -137,13 +145,19 @@ Bit-identical to today's accepted-prefix checkpoint. The replay applies, per
 state element, in this order:
 
 ```python
-state_value = state[e] * decay          # the stored FP32 decay
-state[e]    = state_value + delta * key # the stored FP32 delta and key
+state_value = mul_rn_f32(state[e], decay)          # the stored FP32 decay
+state[e]    = fma_rn_f32(delta, key, state_value)  # the stored delta and key
 ```
 
-which is the same two statements, in the same shape, as the verify loop's
-`state_value = state[e] * decay` followed by `state_value = state[e] + delta *
-shared_k[...]`. Same operands, same FP32 contraction, same FMA selection. The
+Those are inline-asm `mul.rn.f32` and `fma.rn.f32`, because the *contraction*
+is part of the contract, not just the value. The verify loop's decayed value
+has a second use — the `state_dot_k` accumulation — so it is materialized and
+the update is `fma(delta, key, rn(state * decay))`. Written as plain
+`a * b + c * d` the replay's decayed value would have one use, and folding the
+**left** multiply instead is just as valid: that gives
+`fma(state, decay, rn(delta * key))`, a different FP32 number on ~99% of random
+elements, which `test_the_two_fma_orders_are_observably_different` measures
+directly. Pinning both instructions removes the compiler's choice. The
 stored `decay` is the `exp(-exp(A_log) * softplus(a + dt_bias))` the verify pass
 computed; the stored `delta` is `(value - state_dot_k) * beta` **after** the
 BF16 rounding Qwen applies to beta; the stored `key` is the L2-normalized FP32
@@ -210,6 +224,9 @@ model.
 
 All of it is behind `Caps(deferred_checkpoints=True)`, default `False`.
 
+- `_lib/intrinsics.py` — `fma_rn_f32` / `mul_rn_f32`, single PTX
+  instructions behind opaque inline asm. The replay uses them because the
+  contraction, not just the value, is part of the contract: see Numerics.
 - `_cute_kernels.py`
   - `_record_base`, `_store_deferred_record`, `_replay_deferred_records` —
     module-level `@cute.jit` helpers, shared by the verify and commit kernels.
@@ -218,8 +235,11 @@ All of it is behind `Caps(deferred_checkpoints=True)`, default `False`.
     `_run_grouped_request`, and the token loop writes a record instead of a
     snapshot for `relative_token >= 1`. Every new branch is
     `cutlass.const_expr`-guarded and `relative_token` is a `range_constexpr`
-    Python int, so with the knob off the traced program is the old one
-    statement for statement. `head_ratio` pinning and the KDA path are untouched.
+    Python int, so with the knob off every one of them folds away at trace
+    time and the emitted program is semantically the old one. (It is not
+    textually the old one: both request helpers gained an unused
+    `accepted_column` parameter and `source_column` is an extra SSA name that
+    aliases it.) `head_ratio` pinning and the KDA path are untouched.
   - `_CommitDeferredQwenKernel` + `run_commit_deferred_checkpoints` — the
     standalone commit: read column 0, replay `accepted - 1`, write to a
     per-request destination slot. Needed because column 0 is no longer the
@@ -286,6 +306,15 @@ What each half proves:
     accepted 1..5. This covers the *fused* replay, which is the path that ships.
   - Both at bs 1 / 8 / 16, which exercises the ungrouped (bs1) and grouped
     (bs>1 with multi-token requests) dispatches.
+  - `test_mixed_accepted_and_query_lengths_stay_per_request` — accepted
+    `(1,5,3,2)` over query lengths `(1,5,3,2)`. Uniform cases cannot see a
+    replay length borrowed from the wrong request.
+  - `test_the_replay_matches_the_verify_fma_contraction` — a large state
+    with keys near one, so the two contraction orders land an ULP apart and the
+    rtol=0 comparison is actually load-bearing.
+  - `test_a_destination_aliasing_a_record_column_is_refused` — pointing the
+    commit at one of the request's own record blocks must leave the pool
+    untouched, not race the CTAs still replaying out of it.
   - `test_a_single_column_plan_needs_no_records` — a one-column plan must be
     identical with the knob on.
   - The contract tests run without a GPU and are the plan-cache regression guard.
@@ -303,97 +332,102 @@ CPU-side, on any box: `python3 -m py_compile` over the touched files and
 `python3 validation/gdn/deferred_checkpoints.py` (60 bit-identical
 accepted-prefix states, plus the traffic model above).
 
-Do **not** enable this in serving before §vLLM lands: with the knob on and the
-old vLLM binding, the block-boundary state copy would copy a record block.
+Do **not** enable this in serving without the vLLM side of §6: with the knob on
+and an unpatched vLLM, the block-boundary state copy would copy a record block.
 
 ## 6. §vLLM
 
-Fork: `~/GEN-AI/build/vllm` on dgx-01, branch `dev/jovian-judgement`, HEAD
-`e624ae19a3`. Line numbers are as they exist there now. **Sketch, not applied.**
+**Implemented, not sketched.** `ursuciprian/vllm` branch
+`feat/gdn-deferred-checkpoints`, commit `29bf8477f`, cut against `8e1f1e587f`
+(the image base). Every line number below is against `8e1f1e587f`; the earlier
+revision of this section cited a different tree and got most of them wrong.
+The sparkrun mod that applies it to an installed image is
+`mods/vllm-gdn-deferred/` in the `qwen3.8-flash-next` registry.
 
-The decode call path needs no new tensor: `api.run(self._bind_b12x_gdn_decode(...))`
-at `vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py:2615-2625`
-already passes `recurrent_state=self.kv_cache[1]`,
-`state_indices=staging.state_indices` and
-`num_accepted_tokens=staging.num_accepted_tokens`, which is everything the
-scheme uses. Four edits:
+### The readers of a speculative column
 
-**(a) Declare the contract.** `_make_b12x_gdn_caps`, `:841-859`:
+Four, not the two the first draft of this section listed:
 
-```python
-     caps = api.Caps(
-         ...
-         qk_l2norm=True,
-+        deferred_checkpoints=self._gdn_deferred_checkpoints,
-     )
-```
+| reader | file:line | handled how |
+|---|---|---|
+| same-step boundary copy | `vllm/v1/worker/mamba_utils.py:557` in `postprocess_mamba_fused_kernel` (`:444`) | decide → commit → copy |
+| next-step boundary copy | `:688` in `precopy_mamba_align_fused_kernel` (`:627`) | decide → commit → copy |
+| boundary checkpoint export | `:419` in `checkpoint_mamba_states_kernel` (`:379`), reached from `vllm/v1/worker/gpu/boundary_checkpoint.py:651` `capture_mamba` → `checkpoint_request_boundaries` (`mamba_utils.py:1393`) | **refused** |
+| CPU-metadata fallback | `collect_mamba_copy_meta` (`:1545`), reached from `preprocess_mamba:1749` | **refused** (non-fused path) |
 
-with the flag resolved next to `gdn_decode_kernel` (`_resolve_gdn_decode_kernel`,
-`:315`, reading `additional_config`, `:281`) as
-`additional_config["gdn_deferred_checkpoints"]`, default false, and refused
-unless `gdn_decode_kernel == "b12x"`, `state_dtype` is FP32 and
-`num_spec >= 1`. The prefill caps (`:963`, which set `checkpoint_export=True`
-and `null_state_index=0`) are untouched.
+All three kernel readers go through one shared helper, `_copy_mamba_state_block`
+(`:197-374`), whose docstring (`:225-229`) states both contracts. That helper
+does the conv **and** temporal state from a single `token_bias`, which is why
+"keep the conv bias, make the temporal half a commit" needed the helper split
+first — there is no per-half call site to redirect.
 
-**(b) Replace the temporal block-boundary copy with the commit.** This is the
-only place outside the decode kernel that reads a speculative column:
-`_copy_mamba_state_block`, `vllm/v1/worker/mamba_utils.py:359-375`:
+### The edits
 
-```
-362	    actual_src_block_id = tl.load(block_table_base + src_col + token_bias).to(tl.int64)
-363	    src_addr = state_base_addr + actual_src_block_id * state_block_stride
-```
+1. **`vllm/envs.py`** — `VLLM_GDN_DEFERRED_CHECKPOINTS`, default off.
 
-With deferred checkpoints, `block_table[src_col + token_bias]` is a record
-block, not a state. The temporal half of that copy must become, per GDN layer:
+2. **`vllm/v1/worker/gdn_deferred_commit.py`** (new) — the refusal rules, the
+   per-step commit buffers, and `gather_gdn_commit_windows_kernel`, which turns
+   a request's pre-advance running column into the `[r, 0..num_spec]` window
+   b12x's commit expects. Nothing here is reached unless the flag resolves on.
 
-```python
-# deferred checkpoints: the accepted prefix is replayed, not selected
-destination = torch.full((max_seqs,), -1, dtype=torch.int32, device=dev)
-destination[boundary_requests] = block_table[boundary_requests, dst_col]
-api.commit_deferred_checkpoints(layer_binding, destination)
-```
+3. **`mamba_utils.py:197`** — `token_bias` becomes `conv_bias` + `temporal_bias`.
+   The conv halves (`:282`, `:290`, `:321-331`, `:347`) keep the accepted-token
+   bias; the temporal half (`:359-362`) takes the new one. All three call sites
+   pass both.
 
-`destination_indices` is `int32[sequence_capacity]`; `-1` skips a request, so
-the tensor carries the `needs_copy` predicate that
-`postprocess_mamba_fused_kernel` computes at `mamba_utils.py:537-540`. The
-**conv** half of the copy keeps its `token_bias` window shift unchanged.
+4. **`mamba_utils.py:444` and `:627`** — each gains `DEFERRED_TEMPORAL` (pass
+   `temporal_bias = 0`, because the commit already replayed into `bt[src_col]`)
+   and `DECISION_ONLY` (emit `commit_src_col` / `commit_accepted` and return
+   without copying). `DECISION_ONLY` is what keeps the copy decision in exactly
+   one place: the drivers launch the same kernel twice rather than
+   reimplementing `aligned_new_computed >= num_tokens_running_state` (`:537`).
 
-Three call sites read that helper and all three need the same treatment:
-- `postprocess_mamba_fused_kernel`, `mamba_utils.py:444-577` (copy at `:557-577`),
-  reached from `postprocess_mamba_align_gpu`, `:1815-1868`, itself called from
-  `gpu_model_runner.py:1691-1704` right after
-  `self.num_accepted_tokens.gpu[:num_reqs] = (output_token_ids != -1).sum(dim=1)`
-  (`:1684`). Accepted lengths are device-side here, which is what the commit wants.
-- `precopy_mamba_align_fused_kernel`, `mamba_utils.py:627-708`, whose
-  `src_off = max(num_accepted - 1, 0)` (`:612`) becomes `0`, the commit having
-  done the prefix work.
-- the CPU-metadata path `preprocess_mamba`, `mamba_utils.py:1730-1753`, where
-  `accept_token_bias = num_accepted_tokens_cpu[i] - 1` (`:1736`) becomes `0`.
+5. **The two drivers** — `run_fused_postprocess_align` and `run_fused_precopy`
+   run decide → commit → copy when the feature is active, and pass
+   `DEFERRED_TEMPORAL` to the real copy.
 
-**(c) Nothing else changes.** Specifically:
-- `num_accepted_tokens` is already reset to 1 after a boundary copy
-  (`mamba_utils.py:1743`, `:622-623`), which is exactly the post-commit
-  requirement.
-- The `src_col == dst_col` early return (`:684-685`, "kernels locate the initial
-  state in-block via num_accepted") stays: within a block there is no commit,
-  and the decode kernel's fused replay is what locates the state.
-- CUDA graphs: no new buffer, so `GDNAttentionMetadataBuilder`'s graph-owned
-  tensors (`vllm/v1/attention/backends/gdn_attn.py:226-282`) and
-  `_B12xGdnDecodeStaging` (`qwen_gdn_linear_attn.py:93-149`) are unchanged, and
-  the workspace lock (`gpu_model_runner.py:7223-7225`) is not a constraint.
-- Prefix caching: speculative blocks are exclusively owned and unhashed
-  (`single_type_kv_cache_manager.py:2280-2289`) and only the running/aligned
-  block is cached (`:2188-2197`), so the record columns are never observed by
-  another request.
+6. **`preprocess_mamba:1730-1753`** — the assertion §6(d) promised: a request's
+   window must hold distinct blocks. Under this mode a duplicate cell stops
+   being a redundant checkpoint write and becomes a record overwriting the base
+   state, so uniqueness is now correctness, not freshness. It is a handful of
+   host comparisons per step. The accepted-count reset to 1 that the commit
+   contract needs is already there (`:550` device-side, `:1753` host-side).
 
-**(d) The one invariant to confirm before enabling.** Columns
-`0 .. num_spec` of the sliced block table must still hold what the previous step
-wrote, or a record written at step N is gone at step N+1. The shipped kernel
-already depends on this — it reads `state_indices[r, accepted - 1]` — so the
-invariant is not new, but `_relocate_speculative_block`
-(`single_type_kv_cache_manager.py:2280-2289`, called from `:2220-2228`) and
-`remove_skipped_blocks` move and null spec blocks as the window advances, and
-the commit at a boundary is the one place where the consequence changes from
-"wrong checkpoint" to "record read as a state". Confirm it with an assertion in
-`preprocess_mamba` before the first serving run.
+7. **`qwen_gdn_linear_attn.py`** — `_initialize_b12x_gdn_decode` (`:813`)
+   resolves the flag; `_make_b12x_gdn_caps` (`:841`) declares
+   `deferred_checkpoints=`; `_bind_b12x_gdn_decode` (`:1222`, binding the pool
+   at `:1247`) accepts metadata overrides, because the commit runs outside the
+   forward pass where the staged metadata still describes the previous step;
+   and `commit_b12x_gdn_deferred` is the per-layer entry point. The flag is
+   read next to the other GDN options in `additional_config` (`:272`).
+
+### Refused, deliberately
+
+`refuse_reasons` names each one instead of silently falling back, because the
+two paths differ in what the state pool *means* and a silent downgrade would be
+invisible in a benchmark:
+
+- **Request-boundary checkpoints.** One `capture_mamba` can carry up to three
+  distinct biases for the same request (prompt, response and instruction
+  slots, `boundary_checkpoint.py:128-130`), and a single accepted-prefix commit
+  produces one state. Exporting a record block as a state would poison the
+  checkpoint and the prefix-cache entry built from it.
+- **Non-align cache mode**, where the speculative columns are not exclusively
+  owned.
+- **Zero speculative tokens**, where there is nothing to defer.
+
+### Why the pool is safe
+
+- Speculative blocks are exclusively owned and unhashed
+  (`single_type_kv_cache_manager.py:2285`, from `:2226`), so no other request
+  ever observes a record block.
+- `_relocate_speculative_block` (`:2280`) only re-slots within one request's own
+  table, so a record written at step N is still addressable at step N+1 — the
+  same property the shipped kernel already relies on to read
+  `state_indices[r, accepted - 1]`.
+- Only the running/aligned block is prefix-cached.
+- Sizing is untouched: `MambaSpec.page_size_bytes` (`kv_cache_interface.py:955`)
+  and `max_memory_usage_bytes` (`:965`) still allocate
+  `2 + num_speculative_blocks` blocks. Shrinking the speculative blocks to the
+  66 KiB a record actually needs would free ~3.4 GiB at `max_seqs=16`, and is
+  the obvious follow-up.

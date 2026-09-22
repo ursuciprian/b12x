@@ -29,6 +29,10 @@ def test_benchmark_suite_covers_sharded_qwen_head_geometries() -> None:
         "qk8-v24-spec4-bs1",
         "qk8-v24-spec4-uneven",
         "qk8-v24-spec4-bs4",
+        "qk8-v24-verify5-bs1",
+        "qk8-v24-verify5-bs4",
+        "qk8-v24-verify5-bs8",
+        "qk8-v24-verify5-bs16",
         "qk4-v12-decode-bs1",
         "qk2-v6-decode-bs1",
     }
@@ -50,6 +54,16 @@ def test_speculative_cases_preserve_sequential_request_geometry() -> None:
     assert case.columns == 4
     assert by_name["qk8-v24-spec2-bs4"].query_lengths == (2, 2, 2, 2)
     assert by_name["qk8-v24-spec4-bs4"].query_lengths == (4, 4, 4, 4)
+    for name, sequences in (
+        ("qk8-v24-verify5-bs1", 1),
+        ("qk8-v24-verify5-bs4", 4),
+        ("qk8-v24-verify5-bs8", 8),
+        ("qk8-v24-verify5-bs16", 16),
+    ):
+        verify = by_name[name]
+        assert verify.query_lengths == (5,) * sequences
+        assert verify.columns == 5
+        assert verify.sequences == sequences
 
 
 def test_planned_capacity_is_independent_of_live_metadata() -> None:
@@ -93,7 +107,7 @@ def test_graph_contract_poison_precedes_replay_and_state_output_gate() -> None:
 
     output_poison = source.index('binding.output.fill_(float("nan"))')
     replay = source.index("graph.replay()", output_poison)
-    replay_gate = source.index("replay_correctness = _check_current_result")
+    replay_gate = source.index("replay_correctness = ")
     assert output_poison < replay < replay_gate
     assert "graph_replay_after_output_poison" in {
         field.name for field in fields(benchmark.CaseReport)

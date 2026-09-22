@@ -62,6 +62,12 @@ QWEN38_GDN_CASES = (
     BenchmarkCase("qk8-v24-spec4-bs1", (4,), 8, 24),
     BenchmarkCase("qk8-v24-spec4-uneven", (4, 2, 1, 3), 8, 24),
     BenchmarkCase("qk8-v24-spec4-bs4", (4, 4, 4, 4), 8, 24),
+    # Qwen3-Next serving geometry with MTP 4: every request verifies four
+    # proposals plus the target, so the kernel writes five checkpoints today.
+    BenchmarkCase("qk8-v24-verify5-bs1", (5,), 8, 24),
+    BenchmarkCase("qk8-v24-verify5-bs4", (5,) * 4, 8, 24),
+    BenchmarkCase("qk8-v24-verify5-bs8", (5,) * 8, 8, 24),
+    BenchmarkCase("qk8-v24-verify5-bs16", (5,) * 16, 8, 24),
     BenchmarkCase("qk4-v12-decode-bs1", (1,), 4, 12),
     BenchmarkCase("qk2-v6-decode-bs1", (1,), 2, 6),
 )
@@ -71,6 +77,8 @@ QWEN38_GDN_CASES = (
 class CaseBuffers:
     binding: gdn.Binding
     initial_state: torch.Tensor
+    deferred: bool = False
+    deferred_commit_max_abs: float | None = None
 
 
 def resolve_capacity(
@@ -119,6 +127,8 @@ class CaseReport:
     graph_replay_after_output_poison: bool
     stable_addresses: bool
     replay_allocation_bytes: int
+    deferred: bool = False
+    deferred_commit_max_abs: float | None = None
 
 
 def _randn(
@@ -144,6 +154,7 @@ def build_case(
     seed: int,
     capacity_seqs: int | None = None,
     capacity_columns: int | None = None,
+    deferred: bool = False,
 ) -> CaseBuffers:
     if case.value_heads != 3 * case.key_heads:
         raise ValueError(f"Qwen GDN requires value_heads=3*key_heads: {case}")
@@ -167,6 +178,7 @@ def build_case(
         state_dtype=case.state_dtype,
         gate_activation="sigmoid",
         qk_l2norm=True,
+        deferred_checkpoints=bool(deferred),
     )
     planned = gdn.plan(caps)
     (scratch_spec,) = planned.scratch_specs()
@@ -242,7 +254,11 @@ def build_case(
         ),
     }
     binding = gdn.bind(planned, **tensors)
-    return CaseBuffers(binding=binding, initial_state=binding.recurrent_state.clone())
+    return CaseBuffers(
+        binding=binding,
+        initial_state=binding.recurrent_state.clone(),
+        deferred=bool(deferred),
+    )
 
 
 def _reference(buffers: CaseBuffers) -> tuple[torch.Tensor, torch.Tensor]:
@@ -294,6 +310,94 @@ def check_correctness(buffers: CaseBuffers) -> Correctness:
     )
     buffers.binding.recurrent_state.copy_(buffers.initial_state)
     return Correctness(output_max_abs, state_max_abs, nonzero)
+
+
+def _prime_deferred(buffers: CaseBuffers) -> Correctness:
+    """Populate the record columns and gate the replay against the reference.
+
+    The reference persists a full checkpoint per token, so it cannot model a
+    pool whose speculative columns hold records instead. What it can produce is
+    the accepted-prefix checkpoint that the commit must reproduce, which is the
+    whole numerical claim of the deferred scheme, so that is what is compared
+    here. Afterwards the primed pool becomes the restore image, so every timed
+    replay measures the steady state: one base read plus the record replay,
+    then one base write plus the record writes.
+    """
+    binding = buffers.binding
+    live_seqs = int(binding.num_seqs.item())
+    columns = int(binding.state_indices.shape[1])
+    starts = binding.query_start_loc[: live_seqs + 1].tolist()
+    lengths = [starts[index + 1] - starts[index] for index in range(live_seqs)]
+    indices = binding.state_indices.tolist()
+
+    # The verify half, against the reference, with the build-time accepted=1.
+    expected_output, expected_state = _reference(buffers)
+    binding.recurrent_state.copy_(buffers.initial_state)
+    actual = gdn.run(binding)
+    torch.cuda.synchronize()
+    nonzero = int(torch.count_nonzero(actual).item())
+    if nonzero == 0:
+        raise RuntimeError("GDN output is all zero")
+    torch.testing.assert_close(actual, expected_output, rtol=1e-2, atol=2e-2)
+    output_max_abs = float((actual.float() - expected_output.float()).abs().max())
+    base_max_abs = 0.0
+    for request in range(live_seqs):
+        base = indices[request][0]
+        base_max_abs = max(
+            base_max_abs,
+            float(
+                (
+                    binding.recurrent_state[base].float()
+                    - expected_state[base].float()
+                )
+                .abs()
+                .max()
+            ),
+        )
+
+    # The commit half: replay the whole verified prefix and require the
+    # reference's last checkpoint column. The torch reference reduces in a
+    # different order, so this is the FP32 reference tolerance, not bit
+    # identity; bit identity is kernel-against-kernel in
+    # tests/sequence/test_gdn_deferred_checkpoints.py.
+    accepted = torch.tensor(
+        [min(length, columns) for length in lengths],
+        dtype=torch.int32,
+        device=binding.num_accepted_tokens.device,
+    )
+    binding.num_accepted_tokens[:live_seqs].copy_(accepted)
+    destination = torch.full(
+        (int(binding.state_indices.shape[0]),),
+        -1,
+        dtype=torch.int32,
+        device=binding.state_indices.device,
+    )
+    destination[:live_seqs].copy_(binding.state_indices[:live_seqs, 0])
+    gdn.commit_deferred_checkpoints(binding, destination)
+    torch.cuda.synchronize()
+    commit_max_abs = 0.0
+    for request in range(live_seqs):
+        base = indices[request][0]
+        expected = expected_state[indices[request][min(lengths[request], columns) - 1]]
+        torch.testing.assert_close(
+            binding.recurrent_state[base], expected, rtol=1e-5, atol=2e-5
+        )
+        commit_max_abs = max(
+            commit_max_abs,
+            float(
+                (binding.recurrent_state[base].float() - expected.float()).abs().max()
+            ),
+        )
+    buffers.deferred_commit_max_abs = commit_max_abs
+
+    # Re-prime, then freeze the primed pool as the timing restore image.
+    binding.num_accepted_tokens.fill_(1)
+    binding.recurrent_state.copy_(buffers.initial_state)
+    gdn.run(binding)
+    torch.cuda.synchronize()
+    binding.num_accepted_tokens[:live_seqs].copy_(accepted)
+    buffers.initial_state = binding.recurrent_state.clone()
+    return Correctness(output_max_abs, base_max_abs, nonzero)
 
 
 def _check_current_result(
@@ -373,9 +477,9 @@ def _bench_graph(
     warmup: int,
     iterations: int,
     l2_flush,
-) -> tuple[Timing, Correctness, bool, int]:
+) -> tuple[Timing, Correctness | None, bool, int]:
     binding = buffers.binding
-    expected_output, expected_state = _reference(buffers)
+    expected = None if buffers.deferred else _reference(buffers)
 
     def restore() -> None:
         binding.recurrent_state.copy_(buffers.initial_state)
@@ -396,11 +500,13 @@ def _bench_graph(
     graph.replay()
     torch.cuda.synchronize()
     allocated_after = torch.cuda.memory_allocated(binding.output.device)
-    replay_correctness = _check_current_result(
-        buffers,
-        expected_output,
-        expected_state,
+    replay_correctness = (
+        None if expected is None else _check_current_result(buffers, *expected)
     )
+    if expected is None and not bool(
+        torch.isfinite(binding.output).all().item()
+    ):
+        raise RuntimeError("GDN graph output contains non-finite values")
     stats = bench_cuda_graph(
         graph,
         replays=iterations,
@@ -431,6 +537,7 @@ def benchmark_case(
     l2_flush,
     capacity_seqs: int | None = None,
     capacity_columns: int | None = None,
+    deferred: bool = False,
 ) -> CaseReport:
     buffers = build_case(
         case,
@@ -438,8 +545,11 @@ def benchmark_case(
         seed=seed,
         capacity_seqs=capacity_seqs,
         capacity_columns=capacity_columns,
+        deferred=deferred,
     )
-    correctness = check_correctness(buffers)
+    correctness = (
+        _prime_deferred(buffers) if deferred else check_correctness(buffers)
+    )
     eager = (
         _bench_eager(buffers, warmup=warmup, iterations=iterations, l2_flush=l2_flush)
         if mode in ("eager", "both")
@@ -473,9 +583,11 @@ def benchmark_case(
         eager=eager,
         graph=graph,
         graph_correctness=graph_correctness,
-        graph_replay_after_output_poison=graph_correctness is not None,
+        graph_replay_after_output_poison=graph is not None,
         stable_addresses=stable_addresses,
         replay_allocation_bytes=replay_allocation_bytes,
+        deferred=bool(deferred),
+        deferred_commit_max_abs=buffers.deferred_commit_max_abs,
     )
 
 
@@ -571,6 +683,14 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         help="planned state-index columns; defaults to at least 4",
     )
+    parser.add_argument(
+        "--deferred",
+        type=int,
+        nargs="+",
+        choices=(0, 1),
+        default=[0],
+        help="deferred-checkpoint arms to run; 0 is the shipped path",
+    )
     parser.add_argument("--json", type=pathlib.Path)
     args = parser.parse_args(argv)
     if args.warmup < 1 or args.iterations < 1:
@@ -623,6 +743,7 @@ def main(argv: list[str] | None = None) -> int:
         "warmup": args.warmup,
         "iterations": args.iterations,
         "l2_flush": bool(args.l2_flush),
+        "deferred_arms": list(dict.fromkeys(int(v) for v in args.deferred)),
         "capacity_policy": {
             "requested_max_seqs": args.capacity_seqs,
             "requested_state_index_columns": args.capacity_columns,
@@ -632,25 +753,33 @@ def main(argv: list[str] | None = None) -> int:
     }
     print(json.dumps(_jsonable(provenance), sort_keys=True))
     reports: list[CaseReport] = []
+    arms = tuple(dict.fromkeys(int(value) for value in args.deferred))
     for index, case in enumerate(cases):
-        report = benchmark_case(
-            case,
-            device=device,
-            seed=args.seed + index,
-            warmup=args.warmup,
-            iterations=args.iterations,
-            mode=args.mode,
-            l2_flush=l2_flush,
-            capacity_seqs=args.capacity_seqs,
-            capacity_columns=args.capacity_columns,
-        )
-        reports.append(report)
-        print(
-            f"{case.name}: eager[{_timing_text(report.eager)}] "
-            f"graph[{_timing_text(report.graph)}] "
-            f"output_max_abs={report.correctness.output_max_abs:.6g} "
-            f"state_max_abs={report.correctness.state_max_abs:.6g}"
-        )
+        for arm in arms:
+            report = benchmark_case(
+                case,
+                device=device,
+                seed=args.seed + index,
+                warmup=args.warmup,
+                iterations=args.iterations,
+                mode=args.mode,
+                l2_flush=l2_flush,
+                capacity_seqs=args.capacity_seqs,
+                capacity_columns=args.capacity_columns,
+                deferred=bool(arm),
+            )
+            reports.append(report)
+            commit = (
+                ""
+                if report.deferred_commit_max_abs is None
+                else f" commit_max_abs={report.deferred_commit_max_abs:.6g}"
+            )
+            print(
+                f"{case.name} deferred={arm}: eager[{_timing_text(report.eager)}] "
+                f"graph[{_timing_text(report.graph)}] "
+                f"output_max_abs={report.correctness.output_max_abs:.6g} "
+                f"state_max_abs={report.correctness.state_max_abs:.6g}{commit}"
+            )
     gpu_mode_after = nvidia_smi_gpu_mode_snapshot()
     provenance["gpu_mode_after"] = gpu_mode_after
     if args.json is not None:

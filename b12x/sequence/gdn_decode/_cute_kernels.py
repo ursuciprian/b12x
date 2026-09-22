@@ -39,13 +39,26 @@ _NORM_THREADS = 256
 _NORM_WARPS_PER_CTA = _NORM_THREADS // 32
 _NORM_MAX_CTAS = 192
 _GROUPED_VALUE_HEADS = 2
+_VALUE_TILES = _VALUE_DIM // _VALUE_ROWS_PER_CTA
+# Deferred-checkpoint record layout, one block per (value head, value tile):
+# the FP32 L2-normalized key, one delta per value row of the tile, and the
+# scalar decay. Padded to a 16-float boundary so every field stays 16-byte
+# aligned. The block is addressed inside an otherwise unused speculative state
+# slot, which is why the record must never outgrow one value head of a slot.
+_RECORD_DELTA = _KEY_DIM
+_RECORD_DECAY = _KEY_DIM + _VALUE_ROWS_PER_CTA
+_RECORD_FLOATS = (_RECORD_DECAY + 1 + 15) // 16 * 16
+assert _VALUE_TILES * _RECORD_FLOATS <= _VALUE_DIM * _KEY_DIM
 
 _KERNEL_CACHE: dict[tuple[object, ...], Callable[..., None]] = {}
 _WARMED: set[tuple[object, ...]] = set()
 _NORM_CACHE: dict[tuple[object, ...], Callable[[Binding, float], None]] = {}
 _NORM_WARMED: set[tuple[object, ...]] = set()
+_COMMIT_CACHE: dict[tuple[object, ...], Callable[..., None]] = {}
+_COMMIT_WARMED: set[tuple[object, ...]] = set()
 register_program_cache(_KERNEL_CACHE)
 register_program_cache(_NORM_CACHE)
+register_program_cache(_COMMIT_CACHE)
 
 
 def _add(left: Float32, right: Float32) -> Float32:
@@ -82,6 +95,102 @@ def _pointer(
         cute.AddressSpace.gmem,
         assumed_align=max(1, dtype.width // 8),
     )
+
+
+@cute.jit
+def _record_base(
+    record_index: Int64,
+    value_head: Int32,
+    value_row: Int32,
+    state_slot_stride: Int64,
+) -> Int64:
+    """Element offset of one (value head, value tile) record block."""
+    value_tile = value_row // Int32(_VALUE_ROWS_PER_CTA)
+    return (
+        record_index * state_slot_stride
+        + (value_head.to(Int64) * Int64(_VALUE_TILES) + value_tile.to(Int64))
+        * Int64(_RECORD_FLOATS)
+    )
+
+
+@cute.jit
+def _store_deferred_record(
+    recurrent_state: cute.Pointer,
+    record_index: Int64,
+    value_head: Int32,
+    value_row: Int32,
+    decay: Float32,
+    delta: Float32,
+    shared_k: cute.Tensor,
+    shared_key_base: Int32,
+    state_slot_stride: Int64,
+):
+    """Write the decay, per-row delta, and normalized key for one token."""
+    thread, _, _ = cute.arch.thread_idx()
+    thread = Int32(thread)
+    key_lane = thread % Int32(_KEY_LANES_PER_ROW)
+    row_in_tile = thread // Int32(_KEY_LANES_PER_ROW)
+    base = _record_base(record_index, value_head, value_row, state_slot_stride)
+    if key_lane == Int32(0):
+        recurrent_state[
+            base + Int64(_RECORD_DELTA) + row_in_tile.to(Int64)
+        ] = Float32(delta)
+    if thread == Int32(0):
+        recurrent_state[base + Int64(_RECORD_DECAY)] = Float32(decay)
+    if row_in_tile == Int32(0):
+        for key_element in cutlass.range_constexpr(_KEYS_PER_THREAD):
+            key_column = key_lane + Int32(key_element * _KEY_LANES_PER_ROW)
+            recurrent_state[base + key_column.to(Int64)] = Float32(
+                shared_k[shared_key_base + key_column]
+            )
+
+
+@cute.jit
+def _replay_deferred_records(
+    recurrent_state: cute.Pointer,
+    state_indices: cute.Pointer,
+    state: cute.Tensor,
+    request: Int32,
+    value_head: Int32,
+    value_row: Int32,
+    replay_tokens: Int32,
+    state_slot_stride: Int64,
+    state_index_request_stride: Int64,
+    state_index_column_stride: Int64,
+    state_index_columns: cutlass.Constexpr[int],
+):
+    """Advance the base snapshot over the accepted prefix of the last step.
+
+    The two statements below are deliberately shaped like the verify loop's
+    ``state * decay`` followed by ``state + delta * key`` so the same FP32
+    contraction is selected. That is what makes the committed state
+    bit-identical to the checkpoint the verify pass used to persist.
+    """
+    thread, _, _ = cute.arch.thread_idx()
+    thread = Int32(thread)
+    key_lane = thread % Int32(_KEY_LANES_PER_ROW)
+    row_in_tile = thread // Int32(_KEY_LANES_PER_ROW)
+    for relative_token in cutlass.range_constexpr(1, state_index_columns):
+        if Int32(relative_token) <= replay_tokens:
+            index_offset = (
+                request.to(Int64) * state_index_request_stride
+                + Int64(relative_token) * state_index_column_stride
+            )
+            record_index = state_indices[index_offset].to(Int64)
+            base = _record_base(
+                record_index, value_head, value_row, state_slot_stride
+            )
+            decay = Float32(recurrent_state[base + Int64(_RECORD_DECAY)])
+            delta = Float32(
+                recurrent_state[
+                    base + Int64(_RECORD_DELTA) + row_in_tile.to(Int64)
+                ]
+            )
+            for key_element in cutlass.range_constexpr(_KEYS_PER_THREAD):
+                key_column = key_lane + Int32(key_element * _KEY_LANES_PER_ROW)
+                key_value = Float32(recurrent_state[base + key_column.to(Int64)])
+                state_value = state[key_element] * decay
+                state[key_element] = state_value + delta * key_value
 
 
 class _GatedRmsNormKernel:
@@ -227,6 +336,7 @@ class _PackedRecurrentQwenKernel:
         qk_l2norm: bool,
         null_state_index: int | None,
         state_type: type[cutlass.Numeric],
+        deferred_checkpoints: bool = False,
     ) -> None:
         self.max_seqs = int(max_seqs)
         self.state_index_columns = int(state_index_columns)
@@ -235,6 +345,16 @@ class _PackedRecurrentQwenKernel:
         self.head_ratio = self.value_heads // self.key_heads
         if self.head_ratio != 3:
             raise ValueError("CuTe Qwen GDN requires three value heads per key head")
+        self.deferred_checkpoints = bool(deferred_checkpoints)
+        if self.deferred_checkpoints:
+            if state_type is not Float32:
+                raise ValueError(
+                    "deferred GDN checkpoints require an FP32 recurrent state"
+                )
+            if null_state_index is not None:
+                raise ValueError(
+                    "deferred GDN checkpoints require no null state index"
+                )
         self.work_ctas = min(
             _MAX_WORK_CTAS,
             self.max_seqs * self.value_heads * (_VALUE_DIM // _VALUE_ROWS_PER_CTA),
@@ -335,6 +455,7 @@ class _PackedRecurrentQwenKernel:
         value_row: Int32,
         start: Int32,
         end: Int32,
+        accepted_column: Int32,
         source_index: Int64,
         state_slot_stride: Int64,
         mixed_token_stride: Int64,
@@ -364,6 +485,25 @@ class _PackedRecurrentQwenKernel:
             state[key_element] = Float32(
                 recurrent_state[state_base + key_column.to(Int64)]
             )
+        if cutlass.const_expr(self.deferred_checkpoints):
+            _replay_deferred_records(
+                recurrent_state,
+                state_indices,
+                state,
+                request,
+                value_head,
+                value_row,
+                accepted_column,
+                state_slot_stride,
+                state_index_request_stride,
+                state_index_column_stride,
+                self.state_index_columns,
+            )
+            # Every replay read of a record must land before this step's record
+            # writes: the key record is read by all 32 value rows and written
+            # only by row zero, and the delta record is read by all eight key
+            # lanes and written only by lane zero.
+            cute.arch.sync_threads()
 
         allocator = cutlass.utils.SmemAllocator()
         shared_q = allocator.allocate_tensor(
@@ -502,7 +642,21 @@ class _PackedRecurrentQwenKernel:
                     + Int64(relative_token) * state_index_column_stride
                 )
                 destination_index = state_indices[destination_index_offset].to(Int64)
-                if cutlass.const_expr(self.has_null_state_index):
+                if cutlass.const_expr(
+                    self.deferred_checkpoints and relative_token > 0
+                ):
+                    _store_deferred_record(
+                        recurrent_state,
+                        destination_index,
+                        value_head,
+                        value_row,
+                        decay,
+                        delta,
+                        shared_k,
+                        Int32(0),
+                        state_slot_stride,
+                    )
+                elif cutlass.const_expr(self.has_null_state_index):
                     if destination_index != Int64(self.null_state_index):
                         destination_base = (
                             destination_index * state_slot_stride
@@ -548,6 +702,7 @@ class _PackedRecurrentQwenKernel:
         value_row: Int32,
         start: Int32,
         end: Int32,
+        accepted_column: Int32,
         source_index: Int64,
         state_slot_stride: Int64,
         mixed_token_stride: Int64,
@@ -709,6 +864,23 @@ class _PackedRecurrentQwenKernel:
                 state[key_element] = Float32(
                     recurrent_state[state_base + key_column.to(Int64)]
                 )
+            if cutlass.const_expr(self.deferred_checkpoints):
+                _replay_deferred_records(
+                    recurrent_state,
+                    state_indices,
+                    state,
+                    request,
+                    value_head,
+                    value_row,
+                    accepted_column,
+                    state_slot_stride,
+                    state_index_request_stride,
+                    state_index_column_stride,
+                    self.state_index_columns,
+                )
+                # See _run_request: the grouped token loop has no barrier of
+                # its own, so the replay needs this one.
+                cute.arch.sync_threads()
 
             for relative_token in cutlass.range_constexpr(self.state_index_columns):
                 if Int32(relative_token) < end - start:
@@ -768,7 +940,21 @@ class _PackedRecurrentQwenKernel:
                     destination_index = state_indices[destination_index_offset].to(
                         Int64
                     )
-                    if cutlass.const_expr(self.has_null_state_index):
+                    if cutlass.const_expr(
+                        self.deferred_checkpoints and relative_token > 0
+                    ):
+                        _store_deferred_record(
+                            recurrent_state,
+                            destination_index,
+                            value_head,
+                            value_row,
+                            decay,
+                            delta,
+                            shared_k,
+                            shared_token_base,
+                            state_slot_stride,
+                        )
+                    elif cutlass.const_expr(self.has_null_state_index):
                         if destination_index != Int64(self.null_state_index):
                             destination_base = (
                                 destination_index * state_slot_stride
@@ -850,9 +1036,16 @@ class _PackedRecurrentQwenKernel:
             end = query_start_loc[request + Int32(1)].to(Int32)
             if end > start:
                 accepted_column = num_accepted_tokens[request].to(Int32) - Int32(1)
+                source_column = accepted_column
+                if cutlass.const_expr(self.deferred_checkpoints):
+                    # The base snapshot always lives in column zero. The
+                    # accepted prefix of the previous step is replayed onto it
+                    # from the per-token records instead of being read back as
+                    # a full checkpoint.
+                    source_column = Int32(0)
                 source_index_offset = (
                     request.to(Int64) * state_index_request_stride
-                    + accepted_column.to(Int64) * state_index_column_stride
+                    + source_column.to(Int64) * state_index_column_stride
                 )
                 source_index = state_indices[source_index_offset].to(Int64)
                 grouped_heads = (end - start > Int32(1)) & (bounded_seqs > Int32(1))
@@ -912,6 +1105,7 @@ class _PackedRecurrentQwenKernel:
                                     value_row,
                                     start,
                                     end,
+                                    accepted_column,
                                     source_index,
                                     state_slot_stride,
                                     mixed_token_stride,
@@ -938,6 +1132,7 @@ class _PackedRecurrentQwenKernel:
                                     value_row,
                                     start,
                                     end,
+                                    accepted_column,
                                     source_index,
                                     state_slot_stride,
                                     mixed_token_stride,
@@ -964,6 +1159,7 @@ class _PackedRecurrentQwenKernel:
                                 value_row,
                                 start,
                                 end,
+                                accepted_column,
                                 source_index,
                                 state_slot_stride,
                                 mixed_token_stride,
@@ -991,6 +1187,7 @@ class _PackedRecurrentQwenKernel:
                                 value_row,
                                 start,
                                 end,
+                                accepted_column,
                                 source_index,
                                 state_slot_stride,
                                 mixed_token_stride,
@@ -1017,6 +1214,7 @@ class _PackedRecurrentQwenKernel:
                                 value_row,
                                 start,
                                 end,
+                                accepted_column,
                                 source_index,
                                 state_slot_stride,
                                 mixed_token_stride,
@@ -1043,6 +1241,7 @@ class _PackedRecurrentQwenKernel:
                             value_row,
                             start,
                             end,
+                            accepted_column,
                             source_index,
                             state_slot_stride,
                             mixed_token_stride,
@@ -1053,6 +1252,147 @@ class _PackedRecurrentQwenKernel:
                             state_index_column_stride,
                             scale,
                         )
+
+
+class _CommitDeferredQwenKernel:
+    """Materialize the accepted-prefix state from a base snapshot and records.
+
+    The decode kernel leaves the base snapshot in state-index column zero and
+    the per-token records in the speculative columns. Anything outside the
+    decode step that wants the real current state -- vLLM's block-boundary
+    state copy, a state export, a preemption save -- calls this first.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_seqs: int,
+        state_index_columns: int,
+        value_heads: int,
+        state_type: type[cutlass.Numeric],
+    ) -> None:
+        self.max_seqs = int(max_seqs)
+        self.state_index_columns = int(state_index_columns)
+        self.value_heads = int(value_heads)
+        if state_type is not Float32:
+            raise ValueError(
+                "deferred GDN checkpoints require an FP32 recurrent state"
+            )
+        self.state_type = state_type
+        self.work_ctas = min(
+            _MAX_WORK_CTAS, self.max_seqs * self.value_heads * _VALUE_TILES
+        )
+
+    @cute.jit
+    def __call__(
+        self,
+        recurrent_state: cute.Pointer,
+        num_accepted_tokens: cute.Pointer,
+        state_indices: cute.Pointer,
+        destination_indices: cute.Pointer,
+        num_seqs: cute.Pointer,
+        state_slot_stride: Int64,
+        state_index_request_stride: Int64,
+        state_index_column_stride: Int64,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(
+            recurrent_state,
+            num_accepted_tokens,
+            state_indices,
+            destination_indices,
+            num_seqs,
+            state_slot_stride,
+            state_index_request_stride,
+            state_index_column_stride,
+        ).launch(
+            grid=(self.work_ctas, 1, 1),
+            block=(_THREADS, 1, 1),
+            cluster=(1, 1, 1),
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        recurrent_state: cute.Pointer,
+        num_accepted_tokens: cute.Pointer,
+        state_indices: cute.Pointer,
+        destination_indices: cute.Pointer,
+        num_seqs: cute.Pointer,
+        state_slot_stride: Int64,
+        state_index_request_stride: Int64,
+        state_index_column_stride: Int64,
+    ):
+        work_block, _, _ = cute.arch.block_idx()
+        lane, _, _ = cute.arch.thread_idx()
+        work_block = Int32(work_block)
+        key_lane = Int32(lane) % Int32(_KEY_LANES_PER_ROW)
+
+        live_seqs = num_seqs[Int32(0)].to(Int32)
+        bounded_seqs = cutlass.max(
+            Int32(0), cutlass.min(live_seqs, Int32(self.max_seqs))
+        )
+        value_tiles = Int32(_VALUE_TILES)
+        total_work = bounded_seqs * Int32(self.value_heads) * value_tiles
+        work_iterations = cutlass.max(
+            Int32(0),
+            (total_work - work_block + Int32(self.work_ctas - 1))
+            // Int32(self.work_ctas),
+        )
+        for work_iteration in cutlass.range(work_iterations, unroll=1):
+            work = work_block + work_iteration * Int32(self.work_ctas)
+            value_tile = work % value_tiles
+            request_value_head = work // value_tiles
+            value_head = request_value_head % Int32(self.value_heads)
+            request = request_value_head // Int32(self.value_heads)
+            value_row = value_tile * Int32(_VALUE_ROWS_PER_CTA) + Int32(
+                lane
+            ) // Int32(_KEY_LANES_PER_ROW)
+            destination_index = destination_indices[request].to(Int64)
+            if destination_index >= Int64(0):
+                source_index = state_indices[
+                    request.to(Int64) * state_index_request_stride
+                ].to(Int64)
+                # All pool-scaled products are widened before multiplication.
+                state_base = (
+                    source_index * state_slot_stride
+                    + value_head.to(Int64) * Int64(_VALUE_DIM * _KEY_DIM)
+                    + value_row.to(Int64) * Int64(_KEY_DIM)
+                )
+                state = cute.make_rmem_tensor((_KEYS_PER_THREAD,), Float32)
+                for key_element in cutlass.range_constexpr(_KEYS_PER_THREAD):
+                    key_column = key_lane + Int32(
+                        key_element * _KEY_LANES_PER_ROW
+                    )
+                    state[key_element] = Float32(
+                        recurrent_state[state_base + key_column.to(Int64)]
+                    )
+                _replay_deferred_records(
+                    recurrent_state,
+                    state_indices,
+                    state,
+                    request,
+                    value_head,
+                    value_row,
+                    num_accepted_tokens[request].to(Int32) - Int32(1),
+                    state_slot_stride,
+                    state_index_request_stride,
+                    state_index_column_stride,
+                    self.state_index_columns,
+                )
+                destination_base = (
+                    destination_index * state_slot_stride
+                    + value_head.to(Int64) * Int64(_VALUE_DIM * _KEY_DIM)
+                    + value_row.to(Int64) * Int64(_KEY_DIM)
+                )
+                for key_element in cutlass.range_constexpr(_KEYS_PER_THREAD):
+                    key_column = key_lane + Int32(
+                        key_element * _KEY_LANES_PER_ROW
+                    )
+                    recurrent_state[
+                        destination_base + key_column.to(Int64)
+                    ] = self.state_type(state[key_element])
 
 
 def _binding_key(binding: Binding) -> tuple[object, ...]:
@@ -1067,7 +1407,7 @@ def _binding_key(binding: Binding) -> tuple[object, ...]:
         1,
     ):
         raise ValueError("recurrent state must be contiguous within each slot")
-    return (
+    key = (
         binding.output.device.index,
         caps.max_seqs,
         caps.state_index_columns,
@@ -1080,6 +1420,11 @@ def _binding_key(binding: Binding) -> tuple[object, ...]:
         binding.A_log.dtype,
         binding.dt_bias.dtype,
     )
+    # The knob only extends the key when it is on, so the shipped default keeps
+    # the compiled-program identity it had before deferred checkpoints existed.
+    if getattr(caps, "deferred_checkpoints", False):
+        key += ("deferred_checkpoints",)
+    return key
 
 
 def _compile(binding: Binding) -> tuple[tuple[object, ...], Callable[..., None]]:
@@ -1101,6 +1446,7 @@ def _compile(binding: Binding) -> tuple[tuple[object, ...], Callable[..., None]]
         qk_l2norm=caps.qk_l2norm,
         null_state_index=caps.null_state_index,
         state_type=state_type,
+        deferred_checkpoints=getattr(caps, "deferred_checkpoints", False),
     )
     raise_if_kernel_resolution_frozen(
         "cute.compile",
@@ -1230,6 +1576,122 @@ def run_packed_recurrent_qwen(
             _WARMED.add(key)
 
 
+def _commit_key(binding: Binding) -> tuple[object, ...]:
+    caps = binding._state.caps
+    if not caps.deferred_checkpoints:
+        raise ValueError(
+            "the deferred-checkpoint commit requires deferred_checkpoints caps"
+        )
+    return (
+        binding.output.device.index,
+        caps.max_seqs,
+        caps.state_index_columns,
+        caps.value_heads,
+        binding.recurrent_state.dtype,
+        binding.state_indices.dtype,
+    )
+
+
+def _compile_commit(
+    binding: Binding,
+) -> tuple[tuple[object, ...], Callable[..., None]]:
+    key = _commit_key(binding)
+    cached = _COMMIT_CACHE.get(key)
+    if cached is not None:
+        return key, cached
+
+    caps = binding._state.caps
+    state_type = _numeric_type(binding.recurrent_state.dtype)
+    index_type = _numeric_type(binding.state_indices.dtype)
+    kernel = _CommitDeferredQwenKernel(
+        max_seqs=caps.max_seqs,
+        state_index_columns=caps.state_index_columns,
+        value_heads=caps.value_heads,
+        state_type=state_type,
+    )
+    raise_if_kernel_resolution_frozen(
+        "cute.compile", target=kernel, cache_key=key
+    )
+    raw = b12x_compile(
+        kernel,
+        _fake_pointer(state_type),
+        _fake_pointer(Int32),
+        _fake_pointer(index_type),
+        _fake_pointer(Int32),
+        _fake_pointer(Int32),
+        Int64(1),
+        Int64(1),
+        Int64(1),
+        current_cuda_stream(),
+        compile_spec=KernelCompileSpec.from_key(
+            "sequence.gdn_decode.commit_deferred_qwen", 1, key
+        ),
+    )
+
+    def launch(
+        recurrent_state, num_accepted_tokens, state_indices,
+        destination_indices, num_seqs,
+    ) -> None:
+        raw(
+            _pointer(recurrent_state, state_type),
+            _pointer(num_accepted_tokens, Int32),
+            _pointer(state_indices, index_type),
+            _pointer(destination_indices, Int32),
+            _pointer(num_seqs, Int32),
+            int(recurrent_state.stride(0)),
+            int(state_indices.stride(0)),
+            int(state_indices.stride(1)),
+            current_cuda_stream(),
+        )
+
+    attach_programs(launch, raw)
+    _COMMIT_CACHE[key] = launch
+    return key, launch
+
+
+def precompile_commit_deferred_checkpoints(binding: Binding) -> None:
+    """Compile the commit specialization without mutating runtime tensors."""
+    with torch.cuda.device(binding.output.device):
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "CuTe GDN compilation is forbidden during CUDA capture"
+            )
+        _compile_commit(binding)
+
+
+def run_commit_deferred_checkpoints(
+    binding: Binding, destination_indices: torch.Tensor
+) -> None:
+    """Replay the accepted prefix into ``destination_indices`` per request.
+
+    ``destination_indices`` is an int32 device vector over the bound sequence
+    capacity. A negative entry skips that request; an entry equal to
+    ``state_indices[request, 0]`` commits in place. The caller must treat the
+    request's accepted-token count as one afterwards, exactly as vLLM already
+    does after its own block-boundary state copy.
+    """
+    with torch.cuda.device(binding.output.device):
+        key = _commit_key(binding)
+        capturing = torch.cuda.is_current_stream_capturing()
+        launch = _COMMIT_CACHE.get(key)
+        if capturing and (launch is None or key not in _COMMIT_WARMED):
+            raise RuntimeError(
+                "the CuTe GDN commit must be compiled and warm-run before "
+                "CUDA graph capture"
+            )
+        if launch is None:
+            key, launch = _compile_commit(binding)
+        launch(
+            binding.recurrent_state,
+            binding.num_accepted_tokens,
+            binding.state_indices,
+            destination_indices,
+            binding.num_seqs,
+        )
+        if not capturing:
+            _COMMIT_WARMED.add(key)
+
+
 def _norm_key(
     binding: Binding, *, norm_fp32: bool
 ) -> tuple[object, ...]:
@@ -1320,11 +1782,15 @@ def clear_packed_recurrent_qwen_cache() -> None:
     _WARMED.clear()
     _NORM_CACHE.clear()
     _NORM_WARMED.clear()
+    _COMMIT_CACHE.clear()
+    _COMMIT_WARMED.clear()
 
 
 __all__ = [
     "clear_packed_recurrent_qwen_cache",
+    "precompile_commit_deferred_checkpoints",
     "precompile_packed_recurrent_qwen",
+    "run_commit_deferred_checkpoints",
     "run_gated_rmsnorm",
     "run_packed_recurrent_qwen",
 ]

@@ -273,7 +273,7 @@ def _reference(
     buffers: CaseBuffers, state: torch.Tensor | None = None
 ) -> tuple[torch.Tensor, torch.Tensor]:
     binding = buffers.binding
-    caps = binding.plan.caps
+    caps = binding._state.caps
     state = (buffers.initial_state if state is None else state).clone()
     output = gdn.reference.decode(
         binding.mixed_qkv,

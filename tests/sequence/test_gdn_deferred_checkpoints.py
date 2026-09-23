@@ -403,3 +403,251 @@ def test_the_commit_requires_the_deferred_contract() -> None:
     )
     with pytest.raises(ValueError, match="deferred_checkpoints=True"):
         gdn.commit_deferred_checkpoints(binding, destination)
+
+
+# --------------------------------------------------------------------------
+# Graph replay across changing device metadata, SM120 only.
+# --------------------------------------------------------------------------
+
+
+def _cute_cache_sizes() -> tuple[int, int, int]:
+    from b12x.sequence.gdn_decode import _cute_kernels
+
+    return (
+        len(_cute_kernels._KERNEL_CACHE),
+        len(_cute_kernels._NORM_CACHE),
+        len(_cute_kernels._COMMIT_CACHE),
+    )
+
+
+def test_graph_replays_follow_device_live_counts_acceptance_and_order() -> None:
+    """One capture, many steps: live count, lengths, acceptance and row order
+    change only in device memory between replays.
+
+    Sixteen requests each own a five-slot window. Every replay picks a live
+    subset in a fresh order, gives each row a query length in 1..5 and an
+    accepted count no larger than what that request verified last time, so
+    both paths read only state their own previous step wrote. The shipped and
+    deferred graphs must agree bit for bit on output and on the base column,
+    and requests that are not live must be left untouched.
+    """
+    import random
+
+    from b12x._lib.runtime_control import kernel_resolution_guard
+
+    device = require_sm120()
+    requests, columns = 16, 5
+    off_binding, off, on_binding, on = _paired_cases(device, (columns,) * requests)
+    windows = on["state_indices"].clone()
+    both = (off, on)
+
+    def set_step(order, lengths, accepted) -> None:
+        live = len(order)
+        starts = [0]
+        for length in lengths:
+            starts.append(starts[-1] + length)
+        for t in both:
+            t["num_seqs"].fill_(live)
+            t["num_tokens"].fill_(starts[-1])
+            t["query_start_loc"].fill_(starts[-1])
+            t["query_start_loc"][: live + 1].copy_(
+                torch.tensor(starts, dtype=torch.int32, device=device)
+            )
+            t["num_accepted_tokens"].fill_(1)
+            t["state_indices"].copy_(windows)
+            if live:
+                t["num_accepted_tokens"][:live].copy_(
+                    torch.tensor(accepted, dtype=torch.int32, device=device)
+                )
+                t["state_indices"][:live].copy_(windows[list(order)])
+        for name in ("mixed_qkv", "a", "b", "z"):
+            on[name].normal_(0.0, 0.25)
+            off[name].copy_(on[name])
+
+    # Warm (compiles) and prime every window with a five-token step.
+    set_step(range(requests), (columns,) * requests, (1,) * requests)
+    gdn.run(off_binding)
+    gdn.run(on_binding)
+    gdn.precompile_deferred_commit(on_binding)
+    torch.cuda.synchronize(device)
+    verified = [columns] * requests
+
+    graphs = []
+    for binding in (off_binding, on_binding):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            gdn.run(binding)
+        graphs.append(graph)
+    addresses = {
+        (side, name): t[name].data_ptr()
+        for side, t in enumerate(both)
+        for name in t
+    }
+    caches = _cute_cache_sizes()
+
+    rng = random.Random(20260923)
+    schedule = (0, 1, 4, 8, 10, 16, 10, 16, 1, 8, 4, 0, 16)
+    seen_accepted: set[int] = set()
+    with kernel_resolution_guard("deferred GDN multi-replay qualification"):
+        for live in schedule:
+            order = rng.sample(range(requests), live)
+            lengths = [rng.randint(1, columns) for _ in order]
+            accepted = [rng.randint(1, verified[r]) for r in order]
+            if live >= 8:
+                # Keep full-length requests around and place every accepted
+                # count 1..5 on some row that verified enough tokens.
+                lengths[: live // 2] = [columns] * (live // 2)
+                free_rows = list(range(live))
+                for want in range(1, columns + 1):
+                    row = next(
+                        (r for r in free_rows if verified[order[r]] >= want), None
+                    )
+                    if row is not None:
+                        accepted[row] = want
+                        free_rows.remove(row)
+            seen_accepted.update(accepted)
+            set_step(order, lengths, accepted)
+            before = [t["recurrent_state"].clone() for t in both]
+            torch.cuda.synchronize(device)
+            allocated = torch.cuda.memory_allocated(device)
+            for graph in graphs:
+                graph.replay()
+            torch.cuda.synchronize(device)
+            assert torch.cuda.memory_allocated(device) == allocated
+            tokens = sum(lengths)
+            torch.testing.assert_close(
+                on["output"][:tokens], off["output"][:tokens], rtol=0, atol=0
+            )
+            idle = sorted(set(range(requests)) - set(order))
+            for side, t in enumerate(both):
+                for request in idle:
+                    for slot in windows[request].tolist():
+                        assert torch.equal(t["recurrent_state"][slot], before[side][slot])
+            for request in order:
+                base = int(windows[request, 0])
+                torch.testing.assert_close(
+                    on["recurrent_state"][base],
+                    off["recurrent_state"][base],
+                    rtol=0,
+                    atol=0,
+                )
+            for request, length in zip(order, lengths):
+                verified[request] = length
+
+        # The standalone commit, also under the frozen resolution: accepted
+        # prefix of the last replay against the shipped checkpoint column.
+        order = list(rng.sample(range(requests), requests))
+        live = requests
+        accepted = [rng.randint(1, verified[r]) for r in order]
+        on["num_seqs"].fill_(live)
+        on["state_indices"].copy_(windows[order])
+        on["num_accepted_tokens"][:live].copy_(
+            torch.tensor(accepted, dtype=torch.int32, device=device)
+        )
+        gdn.commit_deferred_checkpoints(
+            on_binding, on["state_indices"][:, 0].clone().contiguous()
+        )
+        torch.cuda.synchronize(device)
+        for row, request in enumerate(order):
+            torch.testing.assert_close(
+                on["recurrent_state"][int(windows[request, 0])],
+                off["recurrent_state"][int(windows[request, accepted[row] - 1])],
+                rtol=0,
+                atol=0,
+            )
+
+    assert seen_accepted == set(range(1, columns + 1))
+    assert _cute_cache_sizes() == caches
+    assert addresses == {
+        (side, name): t[name].data_ptr()
+        for side, t in enumerate(both)
+        for name in t
+    }
+
+
+# --------------------------------------------------------------------------
+# Pool offsets above 2**31 elements, SM120 + B12X_TEST_LARGE_POOL=1 only.
+# --------------------------------------------------------------------------
+
+# Five slots per stride multiple crosses 2**31 elements; 1024-element aligned.
+_LARGE_SLOT_STRIDE = ((1 << 31) // 5 // 1024 + 1) * 1024
+
+
+def test_large_slot_stride_crosses_the_signed_32_bit_boundary() -> None:
+    assert 5 * _LARGE_SLOT_STRIDE > (1 << 31) > 4 * _LARGE_SLOT_STRIDE
+    assert _LARGE_SLOT_STRIDE % 4 == 0  # keeps record fields 16-byte aligned
+
+
+def test_replay_and_commit_address_slots_beyond_two_to_the_31() -> None:
+    """Same deferred plan over a compact pool and a pool whose slot stride puts
+    half the slots past element 2**31. Any 32-bit product in the slot, record
+    or destination address lands elsewhere, so the two pools diverge.
+    """
+    import os
+
+    if os.environ.get("B12X_TEST_LARGE_POOL") != "1":
+        pytest.skip("set B12X_TEST_LARGE_POOL=1 in an exclusive GPU window")
+    device = require_sm120()
+    slots = 11
+    slot_elements = 24 * 128 * 128
+    elements = (slots - 1) * _LARGE_SLOT_STRIDE + slot_elements
+    free, _ = torch.cuda.mem_get_info(device)
+    needed = elements * 4 + (2 << 30)
+    if free < needed:
+        pytest.skip(f"needs {needed >> 30} GiB free, have {free >> 30} GiB")
+
+    binding, tensors = _make_case(
+        device=device,
+        query_lengths=(5, 5),
+        max_seqs=2,
+        max_tokens=10,
+        columns=5,
+        state_slots=slots,
+        deferred_checkpoints=True,
+    )
+    storage = torch.empty(elements, dtype=torch.float32, device=device)
+    large = storage.as_strided(
+        tuple(tensors["recurrent_state"].shape),
+        (_LARGE_SLOT_STRIDE, 128 * 128, 128, 1),
+    )
+    large.copy_(tensors["recurrent_state"])
+    # Row 0: base past 2**31, records on both sides. Row 1: the reverse.
+    tensors["state_indices"].copy_(
+        torch.tensor(
+            [[9, 1, 7, 3, 5], [0, 8, 2, 6, 4]], dtype=torch.int32, device=device
+        )
+    )
+    large_output = torch.empty_like(tensors["output"])
+    large_binding = gdn.bind(
+        binding.plan,
+        **{**tensors, "recurrent_state": large, "output": large_output},
+    )
+    compact = tensors["recurrent_state"]
+
+    def step(accepted) -> None:
+        tensors["num_accepted_tokens"][:2].copy_(
+            torch.tensor(accepted, dtype=torch.int32, device=device)
+        )
+        gdn.run(binding)
+        gdn.run(large_binding)
+        torch.cuda.synchronize(device)
+        torch.testing.assert_close(
+            large_output[:10], tensors["output"][:10], rtol=0, atol=0
+        )
+        assert torch.equal(large, compact)
+
+    step((1, 1))  # base + record writes
+    for name in ("mixed_qkv", "a", "b", "z"):
+        tensors[name].normal_(0.0, 0.25)
+    step((5, 3))  # fused replay reads the records back
+
+    tensors["num_accepted_tokens"][:2].copy_(
+        torch.tensor((4, 2), dtype=torch.int32, device=device)
+    )
+    # Row 0 commits into the spare slot 10 (past 2**31), row 1 in place.
+    destination = torch.tensor([10, 0], dtype=torch.int32, device=device)
+    gdn.commit_deferred_checkpoints(binding, destination)
+    gdn.commit_deferred_checkpoints(large_binding, destination)
+    torch.cuda.synchronize(device)
+    assert torch.equal(large, compact)
+    assert bool(compact[10].abs().max() > 0)

@@ -324,9 +324,22 @@ What each half proves:
   against the reference's accepted column (`deferred_commit_max_abs`, at the
   FP32 reference tolerance -- bit identity is pytest's job), then freezes the primed pool as the restore image so every timed
   replay measures the steady state: base read + replay, then base write +
-  record writes. The reference cannot model a pool whose speculative columns
-  hold records, which is why the deferred arm's graph-replay comparison is
-  skipped and the numerics live in pytest.
+  record writes. The reference cannot read a pool whose speculative columns
+  hold records, so the graph-replay gate feeds it the logical accepted-prefix
+  state (the commit applied to a copy of the restore image, placed in column
+  `accepted - 1`) and then checks the output and, for every accepted length
+  1..L, the committed state of the replayed pool against the reference's full
+  checkpoint for that token. Raw record columns are never compared with
+  checkpoint columns.
+- `test_graph_replays_follow_device_live_counts_acceptance_and_order` — one
+  capture per path, then replays with device-side live counts 0/1/4/8/10/16,
+  mixed lengths, accepted 1..5 and permuted row order, under
+  `kernel_resolution_guard`: bit-identical to the shipped path, no allocation,
+  no new CuTe cache entries, unchanged data pointers, idle windows untouched.
+- `test_replay_and_commit_address_slots_beyond_two_to_the_31` — the same plan
+  over a compact pool and a pool whose slot stride puts slots 5..10 past
+  element 2^31 (~16 GiB). Opt in with `B12X_TEST_LARGE_POOL=1` in an exclusive
+  GPU window; it skips on insufficient free memory.
 
 CPU-side, on any box: `python3 -m py_compile` over the touched files and
 `python3 validation/gdn/deferred_checkpoints.py` (60 bit-identical

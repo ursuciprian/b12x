@@ -431,6 +431,7 @@ def test_graph_replays_follow_device_live_counts_acceptance_and_order() -> None:
     deferred graphs must agree bit for bit on output and on the base column,
     and requests that are not live must be left untouched.
     """
+    import gc
     import random
 
     from b12x._lib.runtime_control import kernel_resolution_guard
@@ -464,20 +465,37 @@ def test_graph_replays_follow_device_live_counts_acceptance_and_order() -> None:
             on[name].normal_(0.0, 0.25)
             off[name].copy_(on[name])
 
-    # Warm (compiles) and prime every window with a five-token step.
-    set_step(range(requests), (columns,) * requests, (1,) * requests)
-    gdn.run(off_binding)
-    gdn.run(on_binding)
-    gdn.precompile_deferred_commit(on_binding)
+    # Capture the way vLLM does (gpu_worker.compile_or_warm_up_model +
+    # gpu_model_runner._freeze_gc): warm on the capture stream, keep GC off so
+    # no finalizer unloads a module mid-capture, and refuse kernel resolution.
+    stream = torch.cuda.Stream(device)
+    stream.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(stream):
+        # Warm (compiles) and prime every window with a five-token step.
+        set_step(range(requests), (columns,) * requests, (1,) * requests)
+        gdn.run(off_binding)
+        gdn.run(on_binding)
+        gdn.precompile_deferred_commit(on_binding)
     torch.cuda.synchronize(device)
     verified = [columns] * requests
 
     graphs = []
-    for binding in (off_binding, on_binding):
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            gdn.run(binding)
-        graphs.append(graph)
+    gc.collect()
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        with kernel_resolution_guard("deferred GDN capture"):
+            for label, binding in (("shipped", off_binding), ("deferred", on_binding)):
+                graph = torch.cuda.CUDAGraph()
+                try:
+                    with torch.cuda.graph(graph, stream=stream):
+                        gdn.run(binding)
+                except Exception as error:
+                    raise AssertionError(f"{label} GDN capture failed") from error
+                graphs.append(graph)
+    finally:
+        if gc_was_enabled:
+            gc.enable()
     addresses = {
         (side, name): t[name].data_ptr()
         for side, t in enumerate(both)

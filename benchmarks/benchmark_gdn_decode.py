@@ -67,6 +67,7 @@ QWEN38_GDN_CASES = (
     BenchmarkCase("qk8-v24-verify5-bs1", (5,), 8, 24),
     BenchmarkCase("qk8-v24-verify5-bs4", (5,) * 4, 8, 24),
     BenchmarkCase("qk8-v24-verify5-bs8", (5,) * 8, 8, 24),
+    BenchmarkCase("qk8-v24-verify5-bs10", (5,) * 10, 8, 24),
     BenchmarkCase("qk8-v24-verify5-bs16", (5,) * 16, 8, 24),
     BenchmarkCase("qk4-v12-decode-bs1", (1,), 4, 12),
     BenchmarkCase("qk2-v6-decode-bs1", (1,), 2, 6),
@@ -413,6 +414,36 @@ def _check_current_result(
         raise RuntimeError("GDN graph output is all zero")
     torch.testing.assert_close(actual, expected_output, rtol=1e-2, atol=2e-2)
     state = buffers.binding.recurrent_state
+    if buffers.deferred:
+        # Deferred mode writes a full checkpoint to the committed base column
+        # (index 0 per live sequence) but compact records, not full per-token
+        # checkpoints, to speculative columns 1+. The reference models a full
+        # checkpoint per token, so it is only comparable to the base column;
+        # comparing it to the raw record columns would be comparing two
+        # different representations, not proof of a bug. Kernel-against-kernel
+        # bit-identity for the record/commit path is covered separately in
+        # tests/sequence/test_gdn_deferred_checkpoints.py.
+        binding = buffers.binding
+        live_seqs = int(binding.num_seqs.item())
+        indices = binding.state_indices.tolist()
+        base_max_abs = 0.0
+        for request in range(live_seqs):
+            base = indices[request][0]
+            torch.testing.assert_close(
+                state[base],
+                expected_state[base],
+                rtol=1e-2 if state.dtype == torch.bfloat16 else 1e-5,
+                atol=8e-3 if state.dtype == torch.bfloat16 else 2e-5,
+            )
+            base_max_abs = max(
+                base_max_abs,
+                float((state[base].float() - expected_state[base].float()).abs().max()),
+            )
+        return Correctness(
+            float((actual.float() - expected_output.float()).abs().max()),
+            base_max_abs,
+            nonzero,
+        )
     torch.testing.assert_close(
         state,
         expected_state,
@@ -479,7 +510,7 @@ def _bench_graph(
     l2_flush,
 ) -> tuple[Timing, Correctness | None, bool, int]:
     binding = buffers.binding
-    expected = None if buffers.deferred else _reference(buffers)
+    expected = _reference(buffers)
 
     def restore() -> None:
         binding.recurrent_state.copy_(buffers.initial_state)
@@ -500,13 +531,7 @@ def _bench_graph(
     graph.replay()
     torch.cuda.synchronize()
     allocated_after = torch.cuda.memory_allocated(binding.output.device)
-    replay_correctness = (
-        None if expected is None else _check_current_result(buffers, *expected)
-    )
-    if expected is None and not bool(
-        torch.isfinite(binding.output).all().item()
-    ):
-        raise RuntimeError("GDN graph output contains non-finite values")
+    replay_correctness = _check_current_result(buffers, *expected)
     stats = bench_cuda_graph(
         graph,
         replays=iterations,

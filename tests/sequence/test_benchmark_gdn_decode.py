@@ -32,6 +32,7 @@ def test_benchmark_suite_covers_sharded_qwen_head_geometries() -> None:
         "qk8-v24-verify5-bs1",
         "qk8-v24-verify5-bs4",
         "qk8-v24-verify5-bs8",
+        "qk8-v24-verify5-bs10",
         "qk8-v24-verify5-bs16",
         "qk4-v12-decode-bs1",
         "qk2-v6-decode-bs1",
@@ -58,12 +59,35 @@ def test_speculative_cases_preserve_sequential_request_geometry() -> None:
         ("qk8-v24-verify5-bs1", 1),
         ("qk8-v24-verify5-bs4", 4),
         ("qk8-v24-verify5-bs8", 8),
+        ("qk8-v24-verify5-bs10", 10),
         ("qk8-v24-verify5-bs16", 16),
     ):
         verify = by_name[name]
         assert verify.query_lengths == (5,) * sequences
         assert verify.columns == 5
         assert verify.sequences == sequences
+
+
+def test_case_operand_dtypes_match_the_prepared_qwen_defaults() -> None:
+    """bind() refuses operands whose dtype differs from the prepared plan."""
+    from b12x.sequence.gdn_decode._tuning import GdnQuery
+
+    source = inspect.getsource(benchmark.build_case)
+    assert "dtype=QWEN_A_LOG_DTYPE" in source
+    assert "dtype=QWEN_DT_BIAS_DTYPE" in source
+    for case in benchmark.QWEN38_GDN_CASES:
+        query = GdnQuery(
+            gate_activation="sigmoid",
+            qk_l2norm=True,
+            state_dtype="float32",
+            key_heads=case.key_heads,
+            value_heads=case.value_heads,
+            max_seqs=16,
+            max_tokens=80,
+            state_index_columns=5,
+        )
+        assert query.dt_bias_dtype == str(benchmark.QWEN_DT_BIAS_DTYPE).removeprefix("torch.")
+        assert query.a_log_dtype == str(benchmark.QWEN_A_LOG_DTYPE).removeprefix("torch.")
 
 
 def test_planned_capacity_is_independent_of_live_metadata() -> None:

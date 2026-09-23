@@ -74,6 +74,13 @@ QWEN38_GDN_CASES = (
 )
 
 
+# gdn.plan(caps) without an invocation prepares the Qwen default operand
+# dtypes (GdnQuery: A_log float32, dt_bias bfloat16, as vLLM passes them), and
+# bind() refuses any other dtype.
+QWEN_A_LOG_DTYPE = torch.float32
+QWEN_DT_BIAS_DTYPE = torch.bfloat16
+
+
 @dataclass
 class CaseBuffers:
     binding: gdn.Binding
@@ -215,14 +222,14 @@ def build_case(
             (case.value_heads,),
             device=device,
             generator=generator,
-            dtype=torch.float32,
+            dtype=QWEN_A_LOG_DTYPE,
             scale=0.1,
         ),
         "dt_bias": _randn(
             (case.value_heads,),
             device=device,
             generator=generator,
-            dtype=torch.float32,
+            dtype=QWEN_DT_BIAS_DTYPE,
             scale=0.1,
         ),
         "norm_weight": (

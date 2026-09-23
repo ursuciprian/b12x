@@ -163,3 +163,34 @@ def test_persisted_provenance_covers_reproducibility_and_metric_direction() -> N
     ):
         assert field in source
     assert '"lower_is_better"' in source
+
+
+def test_decode_helpers_read_only_existing_binding_attributes() -> None:
+    """``binding.plan.caps`` crashed every case on GPU; catch that class on CPU."""
+    import ast
+    import dataclasses
+
+    from b12x.preparation.types import Plan
+    from b12x.sequence import gdn_decode as gdn
+
+    known = {
+        "binding": {field.name for field in dataclasses.fields(gdn.Binding)},
+        "buffers": {field.name for field in dataclasses.fields(benchmark.CaseBuffers)},
+    }
+    checked = 0
+    for node in ast.walk(ast.parse(inspect.getsource(benchmark))):
+        if not isinstance(node, ast.Attribute):
+            continue
+        base = node.value
+        if isinstance(base, ast.Name) and base.id in known:
+            assert node.attr in known[base.id], f"{base.id}.{node.attr}"
+            checked += 1
+        elif (
+            isinstance(base, ast.Attribute)
+            and isinstance(base.value, ast.Name)
+            and base.value.id == "binding"
+            and base.attr == "plan"
+        ):
+            assert hasattr(Plan, node.attr), f"binding.plan.{node.attr}"
+            checked += 1
+    assert checked > 50

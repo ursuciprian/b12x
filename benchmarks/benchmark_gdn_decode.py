@@ -262,10 +262,12 @@ def build_case(
     )
 
 
-def _reference(buffers: CaseBuffers) -> tuple[torch.Tensor, torch.Tensor]:
+def _reference(
+    buffers: CaseBuffers, state: torch.Tensor | None = None
+) -> tuple[torch.Tensor, torch.Tensor]:
     binding = buffers.binding
     caps = binding.plan.caps
-    state = buffers.initial_state.clone()
+    state = (buffers.initial_state if state is None else state).clone()
     output = gdn.reference.decode(
         binding.mixed_qkv,
         binding.a,
@@ -401,6 +403,88 @@ def _prime_deferred(buffers: CaseBuffers) -> Correctness:
     return Correctness(output_max_abs, base_max_abs, nonzero)
 
 
+def _commit_on_copy(
+    binding: gdn.Binding, accepted: list[int]
+) -> list[torch.Tensor]:
+    """Logical state per live request: commit ``accepted`` into column 0.
+
+    Runs the shipped commit entry point on the live pool and restores both the
+    pool and ``num_accepted_tokens`` afterwards, so the caller's graph image is
+    untouched. The commit is the one owner of the record representation, so
+    this never compares raw record columns with checkpoint columns.
+    """
+    live_seqs = len(accepted)
+    saved_state = binding.recurrent_state.clone()
+    saved_accepted = binding.num_accepted_tokens.clone()
+    destination = torch.full(
+        (int(binding.state_indices.shape[0]),),
+        -1,
+        dtype=torch.int32,
+        device=binding.state_indices.device,
+    )
+    destination[:live_seqs].copy_(binding.state_indices[:live_seqs, 0])
+    binding.num_accepted_tokens[:live_seqs].copy_(
+        torch.tensor(accepted, dtype=torch.int32, device=destination.device)
+    )
+    gdn.commit_deferred_checkpoints(binding, destination)
+    torch.cuda.synchronize()
+    bases = binding.state_indices[:live_seqs, 0].tolist()
+    committed = [binding.recurrent_state[base].clone() for base in bases]
+    binding.recurrent_state.copy_(saved_state)
+    binding.num_accepted_tokens.copy_(saved_accepted)
+    return committed
+
+
+def _deferred_reference(buffers: CaseBuffers) -> tuple[torch.Tensor, torch.Tensor]:
+    """FP32 reference for one deferred verify step from the primed image.
+
+    The restore image holds a base snapshot in column 0 and records in the
+    speculative columns, which the reference cannot read. Its logical input is
+    the accepted-prefix state, materialized by the commit (itself gated against
+    the reference in ``_prime_deferred``) and placed in the column the
+    reference reads, ``accepted - 1``. The reference then writes a full
+    checkpoint for every verified token, which is what each accepted length's
+    committed state is compared against.
+    """
+    binding = buffers.binding
+    live_seqs = int(binding.num_seqs.item())
+    accepted = binding.num_accepted_tokens[:live_seqs].tolist()
+    indices = binding.state_indices.tolist()
+    saved = binding.recurrent_state.clone()
+    binding.recurrent_state.copy_(buffers.initial_state)
+    committed = _commit_on_copy(binding, accepted)
+    binding.recurrent_state.copy_(saved)
+    logical = buffers.initial_state.clone()
+    for request in range(live_seqs):
+        logical[indices[request][accepted[request] - 1]] = committed[request]
+    return _reference(buffers, logical)
+
+
+def _check_deferred_state(
+    buffers: CaseBuffers, expected_state: torch.Tensor
+) -> float:
+    """Committed logical state for every accepted length vs the reference."""
+    binding = buffers.binding
+    live_seqs = int(binding.num_seqs.item())
+    starts = binding.query_start_loc[: live_seqs + 1].tolist()
+    lengths = [starts[index + 1] - starts[index] for index in range(live_seqs)]
+    indices = binding.state_indices.tolist()
+    worst = 0.0
+    for accepted_length in range(1, max(lengths, default=0) + 1):
+        accepted = [min(accepted_length, length) for length in lengths]
+        committed = _commit_on_copy(binding, accepted)
+        for request in range(live_seqs):
+            expected = expected_state[indices[request][accepted[request] - 1]]
+            torch.testing.assert_close(
+                committed[request], expected, rtol=1e-5, atol=2e-5
+            )
+            worst = max(
+                worst,
+                float((committed[request].float() - expected.float()).abs().max()),
+            )
+    return worst
+
+
 def _check_current_result(
     buffers: CaseBuffers,
     expected_output: torch.Tensor,
@@ -415,33 +499,9 @@ def _check_current_result(
     torch.testing.assert_close(actual, expected_output, rtol=1e-2, atol=2e-2)
     state = buffers.binding.recurrent_state
     if buffers.deferred:
-        # Deferred mode writes a full checkpoint to the committed base column
-        # (index 0 per live sequence) but compact records, not full per-token
-        # checkpoints, to speculative columns 1+. The reference models a full
-        # checkpoint per token, so it is only comparable to the base column;
-        # comparing it to the raw record columns would be comparing two
-        # different representations, not proof of a bug. Kernel-against-kernel
-        # bit-identity for the record/commit path is covered separately in
-        # tests/sequence/test_gdn_deferred_checkpoints.py.
-        binding = buffers.binding
-        live_seqs = int(binding.num_seqs.item())
-        indices = binding.state_indices.tolist()
-        base_max_abs = 0.0
-        for request in range(live_seqs):
-            base = indices[request][0]
-            torch.testing.assert_close(
-                state[base],
-                expected_state[base],
-                rtol=1e-2 if state.dtype == torch.bfloat16 else 1e-5,
-                atol=8e-3 if state.dtype == torch.bfloat16 else 2e-5,
-            )
-            base_max_abs = max(
-                base_max_abs,
-                float((state[base].float() - expected_state[base].float()).abs().max()),
-            )
         return Correctness(
             float((actual.float() - expected_output.float()).abs().max()),
-            base_max_abs,
+            _check_deferred_state(buffers, expected_state),
             nonzero,
         )
     torch.testing.assert_close(
@@ -510,7 +570,7 @@ def _bench_graph(
     l2_flush,
 ) -> tuple[Timing, Correctness | None, bool, int]:
     binding = buffers.binding
-    expected = _reference(buffers)
+    expected = _deferred_reference(buffers) if buffers.deferred else _reference(buffers)
 
     def restore() -> None:
         binding.recurrent_state.copy_(buffers.initial_state)

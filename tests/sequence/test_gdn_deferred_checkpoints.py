@@ -67,9 +67,12 @@ def test_the_knob_stays_out_of_the_selection_key() -> None:
     assert "deferred_checkpoints" not in TUNING.query_fields
     assert TUNING.encode_query(off) == TUNING.encode_query(on)
     # Nothing that feeds the choice digest may move for a default-off knob.
-    assert TUNING.query_schema_version == 4
+    # These pin upstream master's values (2fca4df8: KDA recovery moved the
+    # query schema 4 -> 6 and the candidate contract 3 -> 4); the knob itself
+    # must never bump them.
+    assert TUNING.query_schema_version == 6
     assert TUNING.config_schema_version == 4
-    assert TUNING.candidate_contract_version == 3
+    assert TUNING.candidate_contract_version == 4
     assert TUNING.config_fields == frozenset({"backend", "recurrent_block_v"})
 
 

@@ -20,8 +20,8 @@ compiler and its CUDA 13 libraries come in as wheel dependencies
 `PreparationSession` compiles missing kernels before publishing execution.
 
 The optional vLLM [checkpoint loader](docs/checkpoint-loading.md) uses
-`--load-format b12x`: an asynchronous io_uring/CUDA-copy ring on Spark, and shared
-GPUDirect Storage on discrete GPUs. Both load ordinary PyTorch CUDA allocations. Enable its
+`--load-format b12x`: coherent managed-memory direct I/O on Spark, and shared
+GPUDirect Storage into device memory on discrete GPUs. Enable its
 `b12x_loader` vLLM plugin; the device selects the transport automatically.
 
 ## What's in here

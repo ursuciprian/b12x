@@ -28,7 +28,7 @@ import numpy as np
 import torch
 
 from b12x.loader._checkpoint import DirectWeightSession
-
+from b12x.loader._pool import weight_pool
 from gds_shard_exchange import block_snapshot, build_batch_module, delta, gpu_snapshot, mapped_libraries
 
 
@@ -238,16 +238,18 @@ def main():
         sessions, targets, buffers, owner_readers, records = [], [], [], [], []
         for device in devices:
             torch.cuda.set_device(device)
-            session = stack.enter_context(DirectWeightSession(device, args.io_threads, read_mode="gds"))
+            pool = stack.enter_context(weight_pool(allocation="device", device=device))
+            session = stack.enter_context(DirectWeightSession(device, args.io_threads, allocation_scope=pool))
             sessions.append(session)
-            if not distributed_owner:
-                targets.append(torch.empty(destination_bytes, device=device, dtype=torch.uint8))
-            if not lifecycle:
-                backing = torch.empty(capacity + 65536, device=device, dtype=torch.uint8)
-                start = -backing.data_ptr() % 65536
-                buffers.append(backing[start:start + capacity])
-            else:
-                buffers.append(None)
+            with pool():
+                if not distributed_owner:
+                    targets.append(torch.empty(destination_bytes, device=device, dtype=torch.uint8))
+                if not lifecycle:
+                    backing = torch.empty(capacity + 65536, device=device, dtype=torch.uint8)
+                    start = -backing.data_ptr() % 65536
+                    buffers.append(backing[start:start + capacity])
+                else:
+                    buffers.append(None)
             session._execute(array("Q"))
         gds = sessions[0]._gds
         gds.start_stats(3)

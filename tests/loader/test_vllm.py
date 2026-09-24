@@ -14,14 +14,13 @@ from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 
 from b12x.integration.vllm.loader import B12xModelLoader
 from b12x.loader._checkpoint import DirectWeightSession
-
+from b12x.loader._pool import owns_tensor, shared_pool, weight_allocation, weight_pool
 from b12x.loader._progress import CheckpointDisplay
 
 
 @pytest.mark.parametrize("show_progress", [True, False])
-@pytest.mark.parametrize("read_mode", ["auto", "bounce"])
 def test_draft_iterator_uses_index_and_retained_tensors_keep_their_bytes(
-    tmp_path, capsys, show_progress, read_mode
+    tmp_path, capsys, show_progress
 ):
     """Draft loading must not open unrelated target shards or reuse buffers."""
     save_file({"mtp.weight": torch.arange(16)}, tmp_path / "draft.safetensors")
@@ -41,15 +40,13 @@ def test_draft_iterator_uses_index_and_retained_tensors_keep_their_bytes(
     config = LoadConfig(
         load_format="b12x",
         use_tqdm_on_load=show_progress,
-        model_loader_extra_config={"read_mode": read_mode},
     )
     loader = B12xModelLoader(config)
     source = DefaultModelLoader.Source(
         str(tmp_path), revision=None, prefix="draft.", weight_name_prefixes=("mtp.",)
     )
     with (
-
-        DirectWeightSession(read_mode=loader.read_mode) as session,
+        shared_pool(allocation=weight_allocation()), DirectWeightSession() as session,
         CheckpointDisplay(enabled=show_progress) as display,
     ):
         loader._session = session
@@ -65,7 +62,7 @@ def test_draft_iterator_uses_index_and_retained_tensors_keep_their_bytes(
     torch.testing.assert_close(values["draft.mtp.weight"].cpu(), torch.arange(16))
     torch.testing.assert_close(values["draft.mtp.bias"].cpu(), torch.arange(4) + 100)
     assert config.load_format == "b12x"
-    assert config.model_loader_extra_config == {"read_mode": read_mode}
+    assert config.model_loader_extra_config == {}
     progress = capsys.readouterr().err
     if show_progress:
         assert "b12x routing checkpoint shards" in progress
@@ -89,7 +86,7 @@ def test_gdn_convolution_shards_read_into_final_parameter_slices(tmp_path):
         [(8, 0, 0), (4, 2, 1)], tp_size=2, tp_rank=1
     )
     with (
-
+        shared_pool(allocation=weight_allocation()),
         DirectWeightSession() as session,
         weight_transfer(session),
     ):
@@ -99,8 +96,8 @@ def test_gdn_convolution_shards_read_into_final_parameter_slices(tmp_path):
     torch.testing.assert_close(target.cpu(), checkpoint[4:])
 
 
-def test_hyperconnection_weights_load_without_allocator_hooks(tmp_path, monkeypatch):
-    """Loading the norm must preserve separate workspace contents."""
+def test_loader_policy_keeps_hyperconnection_workspaces_out_of_shared_weights(tmp_path):
+    """Constructor workspaces stay GPU-owned while weights receive direct reads."""
     from vllm.model_executor.weight_transfer import copy_weight, weight_transfer
     from vllm.models.qwen4_exp.nvidia.hyperconnection import (
         GroupedGemmaRMSNorm,
@@ -108,17 +105,13 @@ def test_hyperconnection_weights_load_without_allocator_hooks(tmp_path, monkeypa
         HyperConnectionWorkspace,
     )
 
-    monkeypatch.setattr(
-        "vllm.models.qwen4_exp.nvidia.hyperconnection.get_tensor_model_parallel_world_size",
-        lambda: 1,
-    )
     expected = torch.arange(128, dtype=torch.bfloat16)
     path = tmp_path / "norm.safetensors"
     save_file({"weight": expected}, path)
     with (
-
+        weight_pool(allocation=weight_allocation()) as allocator,
         DirectWeightSession() as session,
-        weight_transfer(session),
+        weight_transfer(session, allocator=allocator),
         torch.device("cuda"),
     ):
         norm = GroupedGemmaRMSNorm(128, eps=1e-6, group_size=32, dtype=expected.dtype)
@@ -135,6 +128,8 @@ def test_hyperconnection_weights_load_without_allocator_hooks(tmp_path, monkeypa
         )
         source = dict(session.weights([path]))["weight"]
         copy_weight(norm.weight, source)
+        assert owns_tensor(norm.weight)
+        assert all(not owns_tensor(buffer) for buffer in workspace.buffers())
     torch.testing.assert_close(norm.weight.cpu(), expected)
     for buffer in workspace.buffers():
         buffer.fill_(7)
@@ -149,7 +144,7 @@ def test_glm_attention_dequantization_reads_owned_checkpoint_inputs(
 ):
     """Numerical projection transforms must consume payloads, not meta views."""
     from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-    from vllm.model_executor.weight_transfer import weight_transfer
+    from vllm.model_executor.weight_transfer import allocate_weights, weight_transfer
     from vllm.models.glm5next.nvidia.model import Glm5NextModel
 
     prefix = "layers.3.self_attn"
@@ -182,12 +177,12 @@ def test_glm_attention_dequantization_reads_owned_checkpoint_inputs(
             return iter([(parameter_name, param)])
 
     with (
-
-        DirectWeightSession() as session,
-        weight_transfer(session),
+        weight_pool(allocation=weight_allocation()) as allocator,
+        DirectWeightSession(allocation_scope=allocator) as session,
+        weight_transfer(session, allocator=allocator),
     ):
         param = torch.nn.Parameter(
-            torch.empty((1, 32), dtype=torch.float32, device="cuda")
+            allocate_weights(torch.empty, (1, 32), dtype=torch.float32, device="cuda")
         )
         param.weight_loader = lambda p, value, shard_id=None: default_weight_loader(
             p, value
@@ -198,15 +193,16 @@ def test_glm_attention_dequantization_reads_owned_checkpoint_inputs(
         )
         loaded = Glm5NextModel.load_weights(Projection(), iter(sources))
         assert loaded == {parameter_name}
+        assert owns_tensor(param)
     torch.testing.assert_close(param.cpu(), expected)
 
 
 @pytest.mark.parametrize("rank", [0, 1])
-def test_kda_convolution_loads_each_tp_shard_into_fused_weights(tmp_path, rank):
+def test_kda_convolution_loads_each_tp_shard_into_fused_wc_weights(tmp_path, rank):
     from vllm.model_executor.layers.mamba.gdn.kimi_gdn_linear_attn import (
         _make_fused_conv1d_weight_loader,
     )
-    from vllm.model_executor.weight_transfer import weight_transfer
+    from vllm.model_executor.weight_transfer import allocate_weights, weight_transfer
 
     path = tmp_path / "kda.safetensors"
     weights = {
@@ -215,11 +211,11 @@ def test_kda_convolution_loads_each_tp_shard_into_fused_weights(tmp_path, rank):
     }
     save_file(weights, path)
     with (
-
+        weight_pool(allocation=weight_allocation()) as allocator,
         DirectWeightSession() as session,
-        weight_transfer(session),
+        weight_transfer(session, allocator=allocator),
     ):
-        param = torch.empty((12, 1, 4), device="cuda")
+        param = allocate_weights(torch.empty, (12, 1, 4), device="cuda")
         loader = _make_fused_conv1d_weight_loader([8, 8, 8], 2, rank)
         sources = dict(session.weights([path]))
         for i, name in enumerate(("q", "k", "v")):
@@ -235,7 +231,7 @@ def test_deepseek_sink_shards_are_flushed_before_derived_weights(
     tmp_path, monkeypatch, tp_size, rank
 ):
     """Padded sinks keep -inf and model post-load hooks consume completed reads."""
-    from vllm.model_executor.weight_transfer import weight_transfer
+    from vllm.model_executor.weight_transfer import allocate_weights, weight_transfer
     from vllm.models.deepseek_v4.nvidia import model as ds4
 
     monkeypatch.setattr(ds4, "get_tensor_model_parallel_world_size", lambda: tp_size)
@@ -253,7 +249,7 @@ def test_deepseek_sink_shards_are_flushed_before_derived_weights(
         def __init__(self):
             super().__init__()
             self.sink = torch.nn.Parameter(
-                torch.full((64,), -torch.inf, device="cuda"),
+                allocate_weights(torch.full, (64,), -torch.inf, device="cuda"),
                 requires_grad=False,
             )
             self.derived = None
@@ -274,9 +270,9 @@ def test_deepseek_sink_shards_are_flushed_before_derived_weights(
             pass
 
     with (
-
+        weight_pool(allocation=weight_allocation()) as allocator,
         DirectWeightSession() as session,
-        weight_transfer(session),
+        weight_transfer(session, allocator=allocator),
     ):
         model = Model()
         assert ds4.DeepseekV4Model.load_weights(model, session.weights([path])) == {
@@ -285,6 +281,8 @@ def test_deepseek_sink_shards_are_flushed_before_derived_weights(
         ds4.DeepseekV4ForCausalLM.process_weights_after_loading(
             SimpleNamespace(model=model)
         )
+        assert owns_tensor(model.sink)
+        assert not owns_tensor(model.derived)
     width = 64 // tp_size
     torch.testing.assert_close(
         model.derived.cpu(), expected[rank * width : (rank + 1) * width] * 2
@@ -299,7 +297,7 @@ def test_dsa_indexer_dequantization_owns_inputs_across_checkpoint_shards(
     """Full GLM's fused WK projection reads real FP8 values before dequantizing."""
     from vllm.model_executor.model_loader.weight_utils import default_weight_loader
     from vllm.model_executor.models.deepseek_v2 import _try_load_fp8_indexer_wk
-    from vllm.model_executor.weight_transfer import weight_transfer
+    from vllm.model_executor.weight_transfer import allocate_weights, weight_transfer
 
     prefix = "layers.0.self_attn.indexer"
     weight = (torch.arange(128 * 256).reshape(128, 256) % 64).to(torch.float8_e4m3fn)
@@ -310,12 +308,13 @@ def test_dsa_indexer_dequantization_owns_inputs_across_checkpoint_shards(
     if scale_first:
         paths.reverse()
     with (
-
-        DirectWeightSession() as session,
-        weight_transfer(session),
+        weight_pool(allocation=weight_allocation()) as allocator,
+        DirectWeightSession(allocation_scope=allocator) as session,
+        weight_transfer(session, allocator=allocator),
     ):
         param = torch.nn.Parameter(
-            torch.zeros((160, 256), device="cuda", dtype=torch.bfloat16
+            allocate_weights(
+                torch.zeros, (160, 256), device="cuda", dtype=torch.bfloat16
             ),
             requires_grad=False,
         )
@@ -338,7 +337,7 @@ def test_dsa_indexer_dequantization_owns_inputs_across_checkpoint_shards(
 def test_dspark_markov_embedding_reads_checkpoint_into_weight_storage(
     tmp_path, monkeypatch
 ):
-    """A plain nn.Embedding loads without allocation hooks."""
+    """The replicated nn.Embedding must opt into the loader's weight allocator."""
     from vllm import envs
     from vllm.model_executor.model_loader.weight_utils import default_weight_loader
     from vllm.model_executor.models.qwen3_dspark import DSparkMarkovHead
@@ -349,9 +348,9 @@ def test_dspark_markov_embedding_reads_checkpoint_into_weight_storage(
     path = tmp_path / "markov.safetensors"
     save_file({"markov_w1.weight": expected}, path)
     with (
-
+        weight_pool(allocation=weight_allocation()) as allocator,
         DirectWeightSession() as session,
-        weight_transfer(session),
+        weight_transfer(session, allocator=allocator),
         torch.device("cuda"),
     ):
         head = DSparkMarkovHead(128, 128, 8, prefix="markov_head")
@@ -359,13 +358,15 @@ def test_dspark_markov_embedding_reads_checkpoint_into_weight_storage(
         default_weight_loader(head.markov_w1.weight, source)
         session.flush()
         result = head.embed(torch.tensor([0, 17, 127]))
+        assert owns_tensor(head.markov_w1.weight)
+        assert not owns_tensor(result)
     torch.testing.assert_close(result.cpu(), expected[[0, 17, 127]])
 
 
 def test_glm_mtp_projection_loads_from_main_shard_without_sharing_runtime_buffers(
     tmp_path, monkeypatch
 ):
-    """MTP's plain Linear loads without a target-model allocation scope."""
+    """MTP's plain Linear is a weight; its index buffers and outputs are not."""
     from vllm.config import VllmConfig, set_current_vllm_config
     from vllm.model_executor.model_loader.weight_utils import default_weight_loader
     from vllm.model_executor.weight_transfer import weight_transfer
@@ -397,9 +398,9 @@ def test_glm_mtp_projection_loads_from_main_shard_without_sharing_runtime_buffer
     )
     with (
         set_current_vllm_config(VllmConfig()),
-
+        weight_pool(allocation=weight_allocation()) as allocator,
         DirectWeightSession() as session,
-        weight_transfer(session),
+        weight_transfer(session, allocator=allocator),
         torch.device("cuda"),
     ):
         layer = mtp.Glm5NextMultiTokenPredictorLayer(vllm_config, "model.layers.45")
@@ -410,5 +411,9 @@ def test_glm_mtp_projection_loads_from_main_shard_without_sharing_runtime_buffer
         default_weight_loader(layer.eh_proj.weight, source[name])
         session.flush()
         result = layer.eh_proj(torch.ones(1, 16))
+        assert owns_tensor(layer.eh_proj.weight)
+        assert not owns_tensor(layer.mtp_block.topk_indices_buffer)
+        assert not owns_tensor(layer.mtp_block.pool_topk_indices_buffer)
+        assert not owns_tensor(result)
     torch.testing.assert_close(layer.eh_proj.weight.cpu(), expected)
     torch.testing.assert_close(result.cpu(), expected.sum(dim=1).unsqueeze(0))

@@ -387,11 +387,6 @@ def validate_moe_decode_config(
     if config.max_active_clusters is not None and config.max_active_clusters <= 0:
         raise ValueError("max_active_clusters must be positive when set")
     if config.max_active_clusters is not None:
-        if (
-            config.route_planner == "triton" and _device is not None
-            and config.max_active_clusters > _device.sm_count
-        ):
-            raise ValueError("NVFP4 grid exceeds the resident SM count")
         repacked_decode = (
             _repacked_w4a8_decode_query(query)
             and config.backend == "dynamic"
@@ -560,12 +555,9 @@ def _tuning_parameters(query, device):
         tile_n=_LEVEL_TILE_N,
     )[2]
     clamp = min(device.sm_count, tasks)
-    # Race partial resident grids without compiling another kernel.
-    ladder = sorted(
-        {1 << exponent for exponent in range(clamp.bit_length())}
-        | {clamp, min(clamp, max(1, device.sm_count // 2)),
-           min(clamp, max(1, 3 * device.sm_count // 4))}
-    )
+    # Grid width is a runtime-only knob: the powers of two up to that clamp,
+    # plus the clamp itself, bracket every resident grid within a factor of two.
+    ladder = sorted({1 << exponent for exponent in range(clamp.bit_length())} | {clamp})
     return {"max_active_clusters": (None, *ladder)}
 
 
@@ -644,7 +636,7 @@ TUNING = TuningContract(
     validate_query=_validate_query,
     validate_config=validate_moe_decode_config,
     default_config=_default_config,
-    candidate_contract_version=17,
+    candidate_contract_version=18,
     knobs=(
         # Enumeration order prefers A16 at equal measured latency on every rank.
         Knob(name="backend", values=("w4a16", "micro", "dynamic"), binding=ParameterBinding.COMPILE),

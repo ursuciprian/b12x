@@ -1192,11 +1192,10 @@ class MoEDynamicKernelBackend:
             )
         self.dynamic_down_scale = dynamic_down_scale
         self.share_input_across_experts = share_input_across_experts
-        # Small NVFP4 tiles and W4A8 split each shared token across two warps.
-        # Only complete pairs participate in the per-token rendezvous.
+        # Pair route warps per input token. M16/M32 have three pairs; M64
+        # and M128 have five. Every pair needs an independent rendezvous.
         self.input_warps_per_token = (
-            2 if share_input_across_experts
-            and (self.is_w4a8 or mma_tiler_mn[0] == 16) else 1
+            2 if self.is_w4a8 and share_input_across_experts else 1
         )
         self.deterministic_output = bool(deterministic_output)
         # swap_ab runs the gated FC1 with the intermediate (logical N) on the
@@ -1313,8 +1312,9 @@ class MoEDynamicKernelBackend:
             barrier_id=3,
             num_threads=self.threads_per_cta,
         )
-        # Disjoint token groups exchange route caches through named barriers
-        # without serializing the whole CTA.
+        # Repacked W4A8's token-owned producer assigns a compile-time group of
+        # warps per input token.  Disjoint named barriers let each group
+        # exchange its route cache without serializing the whole CTA.
         self.input_pair_barrier_0 = pipeline.NamedBarrier(
             barrier_id=4,
             num_threads=self.input_warps_per_token * self.num_threads_per_warp,
@@ -1446,9 +1446,14 @@ class MoEDynamicKernelBackend:
             # each M warp requires sixteen intermediate rows. FC2 keeps its
             # normal orientation over the 128-wide K contraction.
             #
-            # Match the routed token tile so M16 does not retain accumulators
-            # and epilogue addresses for sixteen unused token columns.
-            self._fc1_tok_tile = self.tile_shape_mnk[0]
+            # The token N-role must be a multiple of the fixed sm120 N
+            # permutation atom (8,2,2)=32; a smaller tile (tile_shape_mnk[0] is
+            # 16 here) makes the MMA address phantom N-positions and scrambles
+            # tokens. Round to the permutation atom's 32-column boundary and
+            # mask padding with valid_rows. The 128-row activation atom supplies
+            # the extra slots without retaining unused 64-column accumulators
+            # for M16 and M32 compute tiles.
+            self._fc1_tok_tile = max(32, ((self.tile_shape_mnk[0] + 31) // 32) * 32)
             self.fc1_tile_shape_mnk = (
                 self._fc1_int_tile,
                 self._fc1_tok_tile,
@@ -1464,10 +1469,6 @@ class MoEDynamicKernelBackend:
                 self.sf_vec_size,
                 False,
             )
-            if self._fc1_tok_tile == 16:
-                # The generic N permutation spans 32 columns. Direct SFB
-                # loads permit a compact N16 layout with two N8 MMA warps.
-                fc1_perm = (fc1_perm[0], cute.make_layout(16), fc1_perm[2])
             self.fc1_tiled_mma = cute.make_tiled_mma(
                 mma_op,
                 cute.make_layout(self.fc1_atom_shape),
@@ -3529,8 +3530,8 @@ class MoEDynamicKernelBackend:
         num_cta_warps = Int32(self.num_route_warps)
         input_active_warps = num_cta_warps
         input_groups_per_cta = num_cta_warps
-        if cutlass.const_expr(self.share_input_across_experts):
-            # Shared input assigns a compile-time group of warps to each
+        if cutlass.const_expr(self.is_w4a8 and self.share_input_across_experts):
+            # Shared-input A8 assigns a compile-time group of warps to each
             # token.  Only complete groups may enter the per-token named
             # barrier; otherwise a tail warp in any future non-divisible CTA
             # role layout would wait forever for a partner that was not
@@ -3565,7 +3566,7 @@ class MoEDynamicKernelBackend:
                 claim_count = producer_batch_pairs
                 if cutlass.const_expr(self.share_input_across_experts):
                     # A compile-time warp group cooperates on each token,
-                    # partitioning both routes and quantization blocks.
+                    # partitioning both routes and K/32 blocks under A8.
                     claim_count = input_groups_per_cta
                 batch_base = atomic_add_global_i32(
                     get_ptr_as_int64(pair_head, Int32(0)),
@@ -3583,7 +3584,7 @@ class MoEDynamicKernelBackend:
                 if cutlass.const_expr(self.share_input_across_experts):
                     token_owner_warp = warp_idx
                     token_partition = Int32(0)
-                    if cutlass.const_expr(self.input_warps_per_token > 1):
+                    if cutlass.const_expr(self.is_w4a8):
                         token_owner_warp = warp_idx // Int32(self.input_warps_per_token)
                         token_partition = warp_idx % Int32(self.input_warps_per_token)
                     token_idx = batch_base + token_owner_warp
@@ -3592,7 +3593,7 @@ class MoEDynamicKernelBackend:
                         if lane_id == Int32(0):
                             topk_slot = Int32(0)
                             topk_step = Int32(1)
-                            if cutlass.const_expr(self.input_warps_per_token > 1):
+                            if cutlass.const_expr(self.is_w4a8):
                                 topk_slot = token_partition
                                 topk_step = Int32(self.input_warps_per_token)
                             while topk_slot < num_topk:
@@ -3634,7 +3635,7 @@ class MoEDynamicKernelBackend:
                                     route_expert_ids_addr + slot * Int32(4), expert_id
                                 )
                                 topk_slot += topk_step
-                        if cutlass.const_expr(self.input_warps_per_token > 1):
+                        if cutlass.const_expr(self.is_w4a8):
                             self._sync_input_warp_pair(token_owner_warp)
                         else:
                             cute.arch.sync_warp()
@@ -3867,7 +3868,7 @@ class MoEDynamicKernelBackend:
                                                 + (sf_row // Int32(32)) * Int32(4)
                                             )
 
-                                    sf_idx = lane_id + token_partition * Int32(32)
+                                    sf_idx = lane_id
                                     while sf_idx < sf_blocks_per_row:
                                         block_start = sf_idx * Int32(16)
                                         values = cute.make_rmem_tensor(
@@ -3914,9 +3915,9 @@ class MoEDynamicKernelBackend:
                                                     route_scale_base[cache_slot]
                                                     + scale_k_base
                                                 ] = scale_byte
-                                        sf_idx += Int32(self.input_warps_per_token * 32)
+                                        sf_idx += Int32(32)
                                 else:
-                                    sf_idx = lane_id + token_partition * Int32(32)
+                                    sf_idx = lane_id
                                     while sf_idx < sf_blocks_per_row:
                                         block_start = sf_idx * Int32(16)
                                         values = cute.make_rmem_tensor(
@@ -3979,7 +3980,7 @@ class MoEDynamicKernelBackend:
                                                 )
                                                 scale_storage[scale_offset] = scale_byte
                                             topk_slot += Int32(1)
-                                        sf_idx += Int32(self.input_warps_per_token * 32)
+                                        sf_idx += Int32(32)
 
                             if cutlass.const_expr(self.work_is_streaming):
                                 cute.arch.sync_warp()
@@ -3987,7 +3988,7 @@ class MoEDynamicKernelBackend:
                                 cute.arch.sync_warp()
 
                                 publish_routes = Int32(1)
-                                if cutlass.const_expr(self.input_warps_per_token > 1):
+                                if cutlass.const_expr(self.is_w4a8):
                                     self._sync_input_warp_pair(token_owner_warp)
                                     publish_routes = Int32(1) - token_partition
 

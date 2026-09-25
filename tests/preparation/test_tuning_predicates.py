@@ -81,8 +81,8 @@ CANDIDATES = {
     ('moe.decode', 'nvfp4 rows1250'): (4, 4),
     ('moe.decode', 'nvfp4 rows1280'): (4, 4),
     ('moe.decode', 'nvfp4 rows20'): (195, 14),
-    ('moe.decode', 'nvfp4 rows40'): (194, 15),
-    ('moe.decode', 'nvfp4 rows80'): (194, 17),
+    ('moe.decode', 'nvfp4 rows40'): (194, 14),
+    ('moe.decode', 'nvfp4 rows80'): (194, 15),
     ('moe.decode', 'w4a16 rows10'): (2, 2),
     ('moe.decode', 'w4a16 rows1250'): (1, 1),
     ('moe.decode', 'w4a16 rows1280'): (1, 1),
@@ -763,22 +763,3 @@ def test_gate_mean_partitions_span_one_warp_to_the_covering_block():
     space = TUNING.parameter_space(query, IDENTITY)
     blocks = {assignment["pointwise_block"] for assignment in space.configurations()}
     assert blocks == {32, 64, 128, 256, 512, 1024, 2048, 4096}
-
-
-@pytest.mark.parametrize("sms,capability", [(48, (12, 1)), (188, (12, 0))])
-def test_nvfp4_partial_resident_grids_share_the_compiled_kernel(sms, capability):
-    from b12x.moe.fused_moe import _tuning as component
-
-    _, query = _contract_and_query("moe.decode", DECLARED[("moe.decode", "nvfp4 rows40")])
-    device = DeviceIdentity("nvidia", capability, sms, "Blackwell")
-    eligible = component.TUNING.eligible_plan(query, device)
-    configs = [config for _, config in eligible.candidates
-               if config.route_planner == "triton"]
-    grids = {config.max_active_clusters for config in configs}
-    expected = ({None, 1, 2, 4, 8, 16, 24, 32, 36, 48} if sms == 48 else
-                {None, 1, 2, 4, 8, 16, 32, 64, 94, 126})
-    assert grids == expected
-    assert len({eligible.space.compile_assignment(config.to_dict()) for config in configs}) == 1
-    with pytest.raises(ValueError, match="resident SM count"):
-        component.TUNING.configure(query, device=device,
-            override=replace(configs[0], max_active_clusters=sms + 1))

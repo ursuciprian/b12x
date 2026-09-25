@@ -34,13 +34,11 @@ def request_for_capacity(declaration: object, *, name: str,
                          benchmark_calls: dict[int, Callable[[object], PreparedCall]] | None = None):
     """Make the scalar or exact-M composite request without a legacy warmup path."""
     counts = getattr(declaration, "token_counts", None)
-    if benchmark_calls is None:
-        benchmark_calls = calls
     if counts is None:
         if len(calls) != 1:
             raise ValueError("scalar MoE declaration requires one prepared call")
         return declaration.request(
             name=name, prepare_call=next(iter(calls.values())),
-            benchmark_call=next(iter(benchmark_calls.values())),
+            benchmark_call=None if benchmark_calls is None else next(iter(benchmark_calls.values())),
         )
     return declaration.request(name=name, prepare_calls=calls, benchmark_calls=benchmark_calls)

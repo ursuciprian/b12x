@@ -57,7 +57,7 @@ from cutlass.cutlass_dsl import Int32, Int64, T, Uint8, Uint32, Uint64, dsl_user
 from b12x._lib.intrinsics import (
     bfloat2_to_float2_scaled,
     cp_async4_shared_global,
-    cp_async_u32_shared_global,
+    cp_async_u64_shared_global,
     fabs_f32,
     fmax_f32,
     get_ptr_as_int64,
@@ -357,6 +357,17 @@ class MoEWeightMajorDecodeKernel:
     # ------------------------------------------------------------------ streaming
 
     @cute.jit
+    def _fc1_channel(self, cb: Int32, n: Int32) -> Int32:
+        """Intermediate channel of local FC1 row n (0..7) in channel block cb.
+
+        Block cb covers channels ch0..ch0+3 and ch0+32..ch0+35 (ch0 = 64 * (cb // 8) +
+        4 * (cb % 8)), so each row's F8_128x4 scale word shares an 8 B pair with the
+        word of the row 32 channels up. Needs I % 64 == 0 (wm_geometry checks it).
+        """
+        return ((cb >> Int32(3)) * Int32(64) + (cb & Int32(7)) * Int32(4)
+                + (n & Int32(3)) + (n >> Int32(2)) * Int32(32))
+
+    @cute.jit
     def _issue_stage(self, w13: cute.Tensor, sf13: cute.Tensor, w2: cute.Tensor,
                      sf2: cute.Tensor, base: Int32, tid: Int32, expert: Int32,
                      stage: Int32, slot: Int32):
@@ -368,27 +379,29 @@ class MoEWeightMajorDecodeKernel:
             cb = stage // Int32(2 * g["kchunks"])
             half = (stage // Int32(g["kchunks"])) % Int32(2)
             kc = stage % Int32(g["kchunks"])
-            row0 = half * Int32(I) + cb * Int32(FC1_ROWS)
+            row0 = half * Int32(I)
             per_row = g["k2"] // 16
-            # FC1_ROWS consecutive rows are one contiguous span of FC1_ROWS * K/2 bytes.
-            span = (Int64(expert) * Int64(2 * I) + Int64(row0)) * Int64(g["k2"])
+            # Local rows 0..3 and 4..7 are two contiguous spans of 4 * K/2 bytes
+            # (channels ch0..ch0+3 and ch0+32..ch0+35, see _fc1_channel).
             for i in cutlass.range_constexpr(g["fc1_chunks"] // THREADS):
                 idx = tid + Int32(i * THREADS)
                 r = idx // Int32(per_row)
                 v = idx - r * Int32(per_row)
+                row = row0 + self._fc1_channel(cb, r)
+                src = (Int64(expert) * Int64(2 * I) + Int64(row)) * Int64(g["k2"]) + Int64(v * Int32(16))
                 cp_async4_shared_global(slot_base + r * Int32(g["p1"]) + v * Int32(16),
-                                        get_ptr_as_int64(w13, span + Int64(idx * Int32(16))))
+                                        get_ptr_as_int64(w13, src))
             e_base = Int64(expert) * Int64(g["sf13_expert"])
-            for i in cutlass.range_constexpr(0 if "noscale" in self.probe else -(-g["fc1_words"] // THREADS)):
+            # Rows x and x + 32 own adjacent words of one F8_128x4 16 B chunk: one 8 B
+            # copy per (row pair, K64). Shared layout [K64][pair 0..3][row, row + 32].
+            for i in cutlass.range_constexpr(0 if "noscale" in self.probe else -(-(g["fc1_words"] // 2) // THREADS)):
                 idx = tid + Int32(i * THREADS)
-                if idx < Int32(g["fc1_words"]):
-                    r = idx // Int32(g["fc1_k64"])
-                    j = idx - r * Int32(g["fc1_k64"])
-                    row = row0 + r
-                    k64 = kc * Int32(g["fc1_k64"]) + j
+                if idx < Int32(g["fc1_words"] // 2):
+                    k64 = kc * Int32(g["fc1_k64"]) + (idx >> Int32(2))
+                    row = row0 + self._fc1_channel(cb, idx & Int32(3))
                     off = ((row >> Int32(7)) * Int32(g["sf13_atom"]) + k64 * Int32(512)
                            + (row & Int32(31)) * Int32(16) + ((row & Int32(127)) >> Int32(5)) * Int32(4))
-                    cp_async_u32_shared_global(sf_base + idx * Int32(4),
+                    cp_async_u64_shared_global(sf_base + idx * Int32(8),
                                                get_ptr_as_int64(sf13, e_base + Int64(off)))
         else:
             rb = stage - Int32(g["fc1_stages"])
@@ -403,15 +416,15 @@ class MoEWeightMajorDecodeKernel:
                     cp_async4_shared_global(slot_base + r * Int32(g["p2"]) + v * Int32(16),
                                             get_ptr_as_int64(w2, span + Int64(idx * Int32(16))))
             e_base = Int64(expert) * Int64(g["sf2_expert"])
-            for i in cutlass.range_constexpr(0 if "noscale" in self.probe else -(-g["fc2_words"] // THREADS)):
+            # 8 B per (row pair r, r + 32; K64); shared layout [K64][r 0..31][row, row + 32].
+            for i in cutlass.range_constexpr(0 if "noscale" in self.probe else -(-(g["fc2_words"] // 2) // THREADS)):
                 idx = tid + Int32(i * THREADS)
-                if idx < Int32(g["fc2_words"]):
-                    r = idx // Int32(g["fc2_k64"])
-                    j = idx - r * Int32(g["fc2_k64"])
-                    row = row0 + r
+                if idx < Int32(g["fc2_words"] // 2):
+                    j = idx >> Int32(5)
+                    row = row0 + (idx & Int32(31))
                     off = ((row >> Int32(7)) * Int32(g["sf2_atom"]) + j * Int32(512)
                            + (row & Int32(31)) * Int32(16) + ((row & Int32(127)) >> Int32(5)) * Int32(4))
-                    cp_async_u32_shared_global(sf_base + idx * Int32(4),
+                    cp_async_u64_shared_global(sf_base + idx * Int32(8),
                                                get_ptr_as_int64(sf2, e_base + Int64(off)))
 
     # ------------------------------------------------------------------ kernel
@@ -585,7 +598,8 @@ class MoEWeightMajorDecodeKernel:
                         b_off = slot_base + q * Int32(g["p1"]) + k64 * Int32(32) + Int32(4) * c
                         b0 = ld_shared_u32(b_off)
                         b1 = ld_shared_u32(b_off + Int32(16))
-                        sfb = ld_shared_u32(sf_base + (q * Int32(g["fc1_k64"]) + k64) * Int32(4))
+                        sfb = ld_shared_u32(sf_base + ((k64 * Int32(4) + (q & Int32(3))) * Int32(2)
+                                                       + (q >> Int32(2))) * Int32(4))
                         d0, d1, d2_, d3 = nvfp4_mma_m16n8k64_f32_e2m1(
                             acc[0], acc[1], acc[2], acc[3], a0, a1, a2, a3, b0, b1, sfa, sfb)
                         acc[0] = d0
@@ -619,7 +633,7 @@ class MoEWeightMajorDecodeKernel:
                                 sig = cute.arch.rcp_approx(
                                     cutlass.Float32(1.0) + cute.math.exp(-gv, fastmath=self.fast_math))
                                 acts[e2] = gv * sig * uv
-                            st_shared_u32(h_base + (row * Int32(I) + cb * Int32(FC1_ROWS) + col2) * Int32(2),
+                            st_shared_u32(h_base + (row * Int32(I) + self._fc1_channel(cb, col2)) * Int32(2),
                                           pack_f32x2_to_bfloat2(acts[0], acts[1]))
                     if s == Int32(g["fc1_stages"] - 1):
                         cute.arch.sync_threads()
@@ -645,7 +659,8 @@ class MoEWeightMajorDecodeKernel:
                             b_off = slot_base + b_row * Int32(g["p2"]) + Int32(jj * 32) + Int32(4) * c
                             b0 = ld_shared_u32(b_off)
                             b1 = ld_shared_u32(b_off + Int32(16))
-                            sfb = ld_shared_u32(sf_base + (b_row * Int32(g["fc2_k64"]) + Int32(jj)) * Int32(4))
+                            sfb = ld_shared_u32(sf_base + ((Int32(jj * 32) + (b_row & Int32(31))) * Int32(2)
+                                                           + (b_row >> Int32(5))) * Int32(4))
                             d0, d1, d2_, d3 = nvfp4_mma_m16n8k64_f32_e2m1(
                                 acc[0], acc[1], acc[2], acc[3], a0, a1, a2, a3, b0, b1, sfa, sfb)
                             acc[0] = d0

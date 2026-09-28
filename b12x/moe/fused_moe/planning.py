@@ -8,6 +8,7 @@ from enum import Enum
 import torch
 
 from .._shared.execution import MoEWeightPreparationPlan
+from .._shared.kernels.activations import is_gated_moe_activation
 from ._impl import (
     plan_b12x_fp4_moe_weights,
     prepare_b12x_fp4_moe_weights,
@@ -37,7 +38,11 @@ class ActivationMode(str, Enum):
 
 @dataclass(frozen=True, kw_only=True)
 class ActivationSpec:
-    """Activation precision, nonlinearity, and public I/O dtype."""
+    """Activation precision, nonlinearity, and public I/O dtype.
+
+    ``a16_max_tokens`` forces A16 up to an inclusive token capacity; zero
+    disables the constraint. Larger calls retain ``mode``.
+    """
 
     mode: ActivationMode
     nonlinearity: str
@@ -45,12 +50,15 @@ class ActivationSpec:
     swiglu_limit: float | None = None
     swiglu_alpha: float | None = None
     swiglu_beta: float | None = None
+    a16_max_tokens: int = 0
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "mode", ActivationMode(self.mode))
         object.__setattr__(self, "nonlinearity", str(self.nonlinearity).lower())
         if self.io_dtype not in {torch.bfloat16, torch.float16}:
             raise TypeError("io_dtype must be torch.bfloat16 or torch.float16")
+        if type(self.a16_max_tokens) is not int or self.a16_max_tokens < 0:
+            raise ValueError("a16_max_tokens must be a nonnegative integer")
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -209,6 +217,10 @@ def plan_weights(
 
     if isinstance(source, PackedSource):
         automatic = activation.mode is ActivationMode.AUTO
+        if activation.a16_max_tokens and (
+            source.format.value != "modelopt_nvfp4" or activation.io_dtype is not torch.bfloat16
+        ):
+            raise ValueError("A16 token cutoff requires BF16 inputs and ModelOpt NVFP4 weights")
         if automatic and (
             source.format.value != "modelopt_nvfp4"
             or activation.io_dtype is not torch.bfloat16
@@ -220,6 +232,7 @@ def plan_weights(
         if automatic and source.w13_layout.value != "w13":
             raise ValueError("automatic MoE precision requires up/gate W13 row order")
         recipe = _packed_recipe(source, ActivationMode.A4 if automatic else activation.mode)
+        shared_a16 = activation.a16_max_tokens > 0 and recipe != "w4a16"
         requested_layout = None
         if automatic:
             requested_layout = WeightPacking.SOURCE_NATIVE.value
@@ -233,17 +246,22 @@ def plan_weights(
                 )
             requested_layout = constraints.required_packing.value
         raw_plan = plan_b12x_fp4_moe_weights(
-            quant_modes=("nvfp4", "w4a16") if automatic else recipe,
+            quant_modes=(
+                ("nvfp4", "w4a16") if automatic else
+                (recipe, "w4a16") if shared_a16 else recipe
+            ),
             source_format=source.format.value,
             activation=activation.nonlinearity,
             params_dtype=activation.io_dtype,
             num_experts=geometry.num_experts,
             hidden_size=geometry.hidden_size,
             intermediate_size=geometry.intermediate_size,
-            w13_layout=source.w13_layout.value,
+            w13_layout="w13" if shared_a16 else source.w13_layout.value,
             w4a16_layout=requested_layout,
         )
     elif isinstance(source, TrellisConfig):
+        if activation.a16_max_tokens:
+            raise ValueError("A16 token cutoff requires ModelOpt NVFP4 weights")
         if activation.mode is not ActivationMode.A16:
             raise ValueError("Trellis fused MoE currently requires A16 activations")
         if constraints.required_packing not in {
@@ -316,6 +334,17 @@ def prepare_weights(
     else:
         if not isinstance(weights, PackedWeights):
             raise TypeError("packed preparation requires PackedWeights")
+        if (plan.activation.a16_max_tokens and is_gated_moe_activation(plan._impl.activation)
+                and plan.source.w13_layout.value == "w31" and plan._impl.w13_layout == "w13"):
+            from ._impl import _ensure_w13_kernel_order_inplace
+
+            # Both activation precisions must see the same physical FC1 halves.
+            mode = _packed_recipe(plan.source, plan.activation.mode)
+            _ensure_w13_kernel_order_inplace(
+                weights.w13, weights.w13_block_scales,
+                n=plan.geometry.intermediate_size, k=plan.geometry.hidden_size,
+                quant_mode=mode,
+            )
         input_scale = weights.input_scale
         intermediate_scale = weights.intermediate_scale
         if plan.activation.mode is ActivationMode.A16:

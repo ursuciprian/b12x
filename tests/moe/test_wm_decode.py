@@ -263,3 +263,18 @@ def test_wm_env_selection_keeps_default_query(monkeypatch):
     with pytest.raises(ValueError):
         _control_snapshot()
     assert os.environ["B12X_MOE_WM_MAX_TOKENS"] == "20"
+
+
+def test_wm_min_tokens_control(monkeypatch):
+    """B12X_MOE_WM_MIN_TOKENS adds a floor only when set; out-of-range values fail."""
+    from b12x.moe.fused_moe._preparation import _control_snapshot
+
+    monkeypatch.setenv("B12X_MOE_DECODE_BACKEND", "wm")
+    monkeypatch.setenv("B12X_MOE_WM_MAX_TOKENS", "28")
+    monkeypatch.delenv("B12X_MOE_WM_MIN_TOKENS", raising=False)
+    assert "wm_min_tokens" not in _control_snapshot().to_dict()
+    monkeypatch.setenv("B12X_MOE_WM_MIN_TOKENS", "5")
+    assert _control_snapshot().to_dict()["wm_min_tokens"] == 5
+    monkeypatch.setenv("B12X_MOE_WM_MIN_TOKENS", "29")
+    with pytest.raises(ValueError):
+        _control_snapshot()

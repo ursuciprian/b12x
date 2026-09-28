@@ -12180,6 +12180,7 @@ _WM_KERNEL_CACHE: dict = {}
 register_program_cache(_WM_KERNEL_CACHE)
 _MOE_DECODE_BACKEND_ENV = "B12X_MOE_DECODE_BACKEND"
 _MOE_WM_MAX_TOKENS_ENV = "B12X_MOE_WM_MAX_TOKENS"
+_MOE_WM_MIN_TOKENS_ENV = "B12X_MOE_WM_MIN_TOKENS"
 
 
 def _wm_decode_controls() -> dict:
@@ -12196,7 +12197,16 @@ def _wm_decode_controls() -> dict:
     max_tokens = int(os.environ.get(_MOE_WM_MAX_TOKENS_ENV, "32"))
     if not 1 <= max_tokens <= 32:
         raise ValueError(f"{_MOE_WM_MAX_TOKENS_ENV} must be within 1..32, got {max_tokens}")
-    return {"decode_backend": "wm", "wm_max_tokens": max_tokens}
+    controls = {"decode_backend": "wm", "wm_max_tokens": max_tokens}
+    # Optional floor: small batches (e.g. the MTP draft layer at 1..4 tokens) touch few
+    # experts, which leaves most CTAs of the one-CTA-per-expert wm grid idle.
+    min_env = os.environ.get(_MOE_WM_MIN_TOKENS_ENV, "").strip()
+    if min_env:
+        min_tokens = int(min_env)
+        if not 1 <= min_tokens <= max_tokens:
+            raise ValueError(f"{_MOE_WM_MIN_TOKENS_ENV} must be within 1..{max_tokens}, got {min_tokens}")
+        controls["wm_min_tokens"] = min_tokens
+    return controls
 
 
 def _wm_shadow_dynamic_config(config: MoeDecodeConfig) -> MoeDecodeConfig:

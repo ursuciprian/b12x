@@ -210,7 +210,8 @@ def _wm_eligible(query: MoeDecodeQuery) -> bool:
         and not query.apply_router_weight_on_input
         and not query.collect_activation_amax
         and not query.deterministic_output
-        and 1 <= query.num_tokens <= int(query.controls.get("wm_max_tokens", 32))
+        and int(query.controls.get("wm_min_tokens", 1)) <= query.num_tokens
+        <= int(query.controls.get("wm_max_tokens", 32))
     ):
         return False
     from b12x.moe._shared.kernels.wm_geometry import wm_geometry

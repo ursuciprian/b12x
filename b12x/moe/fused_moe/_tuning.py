@@ -316,6 +316,41 @@ def _nvfp4_materialization_eligible(query, config):
     )
 
 
+def _wm_eligible(query: MoeDecodeQuery) -> bool:
+    """Whether the opt-in weight-major decode backend owns this concrete query."""
+    if query.controls.get("decode_backend") != "wm":
+        return False
+    if not (
+        query.quant_mode == "nvfp4"
+        and query.source_format == "modelopt_nvfp4"
+        and query.activation == "silu"
+        and query.io_dtype == "bfloat16"
+        and query.swiglu_limit is None
+        and not query.apply_router_weight_on_input
+        and not query.collect_activation_amax
+        and not query.deterministic_output
+        and 1 <= query.num_tokens <= int(query.controls.get("wm_max_tokens", 32))
+    ):
+        return False
+    from b12x.moe._shared.kernels.wm_geometry import wm_geometry
+
+    try:
+        wm_geometry(
+            hidden_size=query.hidden_size,
+            intermediate_size=query.intermediate_size,
+            num_experts=query.num_experts,
+            top_k=query.top_k,
+            max_tokens=query.num_tokens,
+        )
+    except ValueError:
+        return False
+    return True
+
+
+def _wm_config() -> MoeDecodeConfig:
+    return MoeDecodeConfig(backend="wm", route_planner="internal", max_active_clusters=None)
+
+
 def validate_moe_decode_config(
     query: MoeDecodeQuery,
     config: MoeDecodeConfig,
@@ -364,6 +399,18 @@ def validate_moe_decode_config(
         config.nvfp4_inline_scales,
     )):
         raise TypeError("NVFP4 lowering controls must be boolean")
+    wm_owned = _wm_eligible(query)
+    if config.backend == "wm":
+        if not wm_owned:
+            raise ValueError(
+                "the wm backend requires B12X_MOE_DECODE_BACKEND=wm and an eligible "
+                "NVFP4 SiLU decode query"
+            )
+        if config != _wm_config():
+            raise ValueError("the wm backend takes no routing, tile or lowering knobs")
+        return
+    if wm_owned:
+        raise ValueError("B12X_MOE_DECODE_BACKEND=wm pins this decode query to the wm backend")
     if config.nvfp4_share_input and not (
         query.quant_mode == "nvfp4" and config.backend == "dynamic" and query.shared_input_scales
     ):
@@ -476,6 +523,8 @@ def _default_config(query: MoeDecodeQuery, device: DeviceIdentity | None) -> Moe
         if len(non_a16) != 1:
             raise ValueError("multi-recipe MoE requires an explicit default recipe route")
         query = replace(query, quant_mode=non_a16[0])
+    if _wm_eligible(query):
+        return _wm_config()
     config = _heuristic_moe_decode_config(query, device)
     config = replace(config, nvfp4_share_input=bool(
         _nvfp4_query(query) and config.backend == "dynamic" and query.shared_input_scales
@@ -696,7 +745,7 @@ TUNING = TuningContract(
     candidate_contract_version=23,
     knobs=(
         # Enumeration order prefers A16 at equal measured latency on every rank.
-        Knob(name="backend", values=("w4a16", "micro", "dynamic"), binding=ParameterBinding.COMPILE),
+        Knob(name="backend", values=("w4a16", "micro", "dynamic", "wm"), binding=ParameterBinding.COMPILE),
         Knob(name="route_planner", values=("internal", "triton"), binding=ParameterBinding.COMPILE),
         Knob(name="max_active_clusters", values=None, binding=ParameterBinding.RUNTIME, when=FrozenMapping({"route_planner": "triton"})),
         Knob(name="dynamic_tile_m", values=(16, 32, 64, 128), binding=ParameterBinding.COMPILE, when=FrozenMapping({"backend": "dynamic"})),

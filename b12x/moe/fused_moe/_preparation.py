@@ -102,6 +102,7 @@ def _control_snapshot() -> FrozenMapping:
 
     tile = _impl._dynamic_tile_mn_override()
     raw_materialized = _impl.os.environ.get(_impl._DYNAMIC_NVFP4_MATERIALIZED_ENV)
+    wm = _impl._wm_decode_controls()
     return FrozenMapping({
         "trellis_decode_table": trellis_decode_table(),
         "w4a16_small_m_occupancy": _w4a16_small_m_occupancy(),
@@ -111,6 +112,7 @@ def _control_snapshot() -> FrozenMapping:
         "w4a16_skip_empty_m_blocks": _impl.os.environ.get(
             "B12X_W4A16_SKIP_EMPTY_M_BLOCKS", "1"
         ) == "1",
+        **wm,
         "dynamic_nvfp4_materialized": (
             None if raw_materialized is None else raw_materialized not in ("", "0", "false", "False")
         ),
@@ -719,6 +721,12 @@ def _program_carriers(
                         trellis_intermediate_hadamard=caps.weight_plan.intermediate_hadamard,
                     )
                     launches.append(launch)
+    elif plan.implementation == "dynamic" and plan.decode_config.backend == "wm":
+        for dtype in (torch.int32, torch.int64):
+            launches.append(_impl._get_wm_kernel(
+                plan.weight_E, plan.routed_rows // plan.num_topk, plan.k, plan.n,
+                plan.num_topk, topk_ids_dtype=dtype, fast_math=caps.w4a16_fast_math,
+            ))
     elif plan.implementation == "dynamic":
         exact_m = plan.routed_rows // plan.num_topk
         dynamic = _dynamic_program_arguments(plan, caps)

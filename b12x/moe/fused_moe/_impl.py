@@ -7397,6 +7397,11 @@ def plan_tp_moe_execution(
     device = torch.device(device)
     if not isinstance(decode_config, MoeDecodeConfig):
         raise TypeError("decode_config must be a concrete MoeDecodeConfig")
+    # The weight-major decode backend reuses the dynamic scratch, workspace and
+    # binding contract unchanged (it needs none of it); only its launch differs.
+    plan_decode_config = decode_config
+    if decode_config.backend == "wm":
+        decode_config = _wm_shadow_dynamic_config(decode_config)
     weight_E = weight_plan.num_experts
     k = weight_plan.hidden_size
     n = weight_plan.intermediate_size
@@ -7579,7 +7584,7 @@ def plan_tp_moe_execution(
         max_tokens_per_launch=max_tokens_per_launch,
         dynamic_physical_tiles=dynamic_physical_tiles,
         dynamic_task_capacity=dynamic_task_capacity,
-        decode_config=decode_config,
+        decode_config=plan_decode_config,
     )
 
 
@@ -12718,6 +12723,164 @@ def _tiny_decode_supports(*, num_tokens: int, k: int, n: int, activation: str) -
 
 _TINY_DECODE_KERNEL_CACHE: dict = {}
 register_program_cache(_TINY_DECODE_KERNEL_CACHE)
+_WM_KERNEL_CACHE: dict = {}
+register_program_cache(_WM_KERNEL_CACHE)
+_MOE_DECODE_BACKEND_ENV = "B12X_MOE_DECODE_BACKEND"
+_MOE_WM_MAX_TOKENS_ENV = "B12X_MOE_WM_MAX_TOKENS"
+
+
+def _wm_decode_controls() -> dict:
+    """Query controls for the opt-in weight-major decode backend.
+
+    Present only when ``B12X_MOE_DECODE_BACKEND=wm`` is set, so the default
+    path's query (and every selection-cache key) stays byte-identical.
+    """
+    backend = os.environ.get(_MOE_DECODE_BACKEND_ENV, "").strip().lower()
+    if backend in ("", "auto", "default"):
+        return {}
+    if backend != "wm":
+        raise ValueError(f"{_MOE_DECODE_BACKEND_ENV} must be 'wm' or unset, got {backend!r}")
+    max_tokens = int(os.environ.get(_MOE_WM_MAX_TOKENS_ENV, "32"))
+    if not 1 <= max_tokens <= 32:
+        raise ValueError(f"{_MOE_WM_MAX_TOKENS_ENV} must be within 1..32, got {max_tokens}")
+    return {"decode_backend": "wm", "wm_max_tokens": max_tokens}
+
+
+def _wm_shadow_dynamic_config(config: MoeDecodeConfig) -> MoeDecodeConfig:
+    """Dynamic M16 grouped config whose scratch/workspace a ``wm`` plan reuses."""
+    return replace(
+        config,
+        backend="dynamic",
+        dynamic_tile_m=16,
+        dynamic_route_mode="grouped",
+        nvfp4_share_input=False,
+        nvfp4_materialize_intermediate=False,
+    )
+
+
+def _get_wm_kernel(
+    weight_E: int,
+    max_tokens: int,
+    k: int,
+    n: int,
+    num_topk: int,
+    *,
+    topk_ids_dtype: torch.dtype,
+    fast_math: bool,
+):
+    from b12x.moe._shared.kernels.wm_decode import MoEWeightMajorDecodeKernel
+
+    kernel = MoEWeightMajorDecodeKernel(
+        hidden_size=k,
+        intermediate_size=n,
+        num_experts=weight_E,
+        top_k=num_topk,
+        max_tokens=max_tokens,
+        fast_math=fast_math,
+        ids_int64=topk_ids_dtype == torch.int64,
+    )
+    cache_key = kernel.__cache_key__
+    cached = None if planning() else _WM_KERNEL_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    def dummy(dt, align=16):
+        return make_ptr(dt, 16, cute.AddressSpace.gmem, assumed_align=align)
+
+    raise_if_kernel_resolution_frozen("cute.compile", target=kernel, cache_key=cache_key)
+    ids_dtype = cutlass.Int64 if kernel.ids_int64 else cutlass.Int32
+    compiled = b12x_compile(
+        kernel,
+        dummy(cutlass.BFloat16),  # x
+        dummy(ids_dtype, 8 if kernel.ids_int64 else 4),  # topk ids
+        dummy(cutlass.Float32, 4),  # topk weights
+        dummy(cutlass.Uint8),  # w13 payload
+        dummy(cutlass.Uint8),  # w13 scales
+        dummy(cutlass.Uint8),  # down payload
+        dummy(cutlass.Uint8),  # down scales
+        dummy(cutlass.Float32, 4),  # FC1 input scale
+        dummy(cutlass.Float32, 4),  # FC1 alpha
+        dummy(cutlass.Float32, 4),  # FC2 input scale
+        dummy(cutlass.Float32, 4),  # FC2 alpha
+        dummy(cutlass.BFloat16),  # output
+        Int32(max_tokens),
+        Int32(1),
+        current_cuda_stream(),
+        compile_spec=KernelCompileSpec.from_key("integration.tp_moe.wm_decode", 1, cache_key),
+    )
+    if not planning():
+        _WM_KERNEL_CACHE[cache_key] = compiled
+    return compiled
+
+
+def _launch_wm(
+    *,
+    weights: "_WeightViews",
+    a: torch.Tensor,
+    flat_ids: torch.Tensor,
+    flat_weights: torch.Tensor,
+    input_gs: torch.Tensor,
+    down_input_scale: torch.Tensor,
+    scatter_output: torch.Tensor,
+    weight_E: int,
+    k: int,
+    n: int,
+    num_topk: int,
+    max_tokens: int,
+    fast_math: bool,
+) -> None:
+    """Zero the output in-stream, then run the weight-major decode kernel."""
+    m = a.shape[0]
+    if m > max_tokens:
+        raise ValueError(f"wm decode launch has {m} tokens > planned {max_tokens}")
+    if not (a.is_contiguous() and flat_ids.is_contiguous() and flat_weights.is_contiguous()):
+        raise ValueError("wm decode requires contiguous activations and routes")
+    if flat_weights.dtype != torch.float32:
+        raise TypeError("wm decode requires float32 router weights")
+    w13 = weights.w1_storage
+    w2 = weights.w2_storage
+    sf13 = weights.w1_scale_storage.view(torch.uint8)
+    sf2 = weights.w2_scale_storage.view(torch.uint8)
+    from b12x.moe._shared.kernels.wm_geometry import wm_geometry
+
+    geo = wm_geometry(hidden_size=k, intermediate_size=n, num_experts=weight_E,
+                      top_k=num_topk, max_tokens=max_tokens)
+    if (
+        w13.numel() != weight_E * 2 * n * (k // 2)
+        or w2.numel() != weight_E * k * (n // 2)
+        or sf13.numel() != weight_E * geo["sf13_expert"]
+        or sf2.numel() != weight_E * geo["sf2_expert"]
+    ):
+        raise ValueError("wm decode weight storage does not match the NVFP4 contract")
+    compiled = _get_wm_kernel(
+        weight_E, max_tokens, k, n, num_topk,
+        topk_ids_dtype=flat_ids.dtype, fast_math=fast_math,
+    )
+
+    def ptr(dt, t, align=16):
+        return make_ptr(dt, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=align)
+
+    scatter_output.zero_()
+    if m == 0:
+        return
+    ids_dtype = cutlass.Int64 if flat_ids.dtype == torch.int64 else cutlass.Int32
+    compiled(
+        ptr(cutlass.BFloat16, a),
+        ptr(ids_dtype, flat_ids, flat_ids.element_size()),
+        ptr(cutlass.Float32, flat_weights, 4),
+        ptr(cutlass.Uint8, w13.view(torch.uint8)),
+        ptr(cutlass.Uint8, sf13),
+        ptr(cutlass.Uint8, w2.view(torch.uint8)),
+        ptr(cutlass.Uint8, sf2),
+        ptr(cutlass.Float32, input_gs, 4),
+        ptr(cutlass.Float32, weights.w1_alpha, 4),
+        ptr(cutlass.Float32, down_input_scale, 4),
+        ptr(cutlass.Float32, weights.w2_alpha, 4),
+        ptr(cutlass.BFloat16, scatter_output),
+        Int32(m),
+        Int32(get_num_sm(a.device)),
+        current_cuda_stream(),
+    )
 
 
 def _get_tiny_decode_kernel(
@@ -13768,6 +13931,23 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
         )
         return scatter_output
 
+    if impl == "dynamic" and plan.decode_config.backend == "wm":
+        _launch_wm(
+            weights=wv,
+            a=a,
+            flat_ids=flat_ids,
+            flat_weights=flat_weights,
+            input_gs=input_gs,
+            down_input_scale=down_input_scale,
+            scatter_output=scatter_output,
+            weight_E=weight_E,
+            k=k,
+            n=n,
+            num_topk=num_topk,
+            max_tokens=plan.routed_rows // num_topk,
+            fast_math=fast_math,
+        )
+        return scatter_output
     if impl == "dynamic":
         if plan.decode_config.nvfp4_share_input and not experts.can_share_input(
             input_scales_static=True

@@ -13,7 +13,6 @@ import pytest
 import torch
 
 from b12x.moe._shared.kernels.wm_geometry import (
-    FC1_KCHUNK,
     FC1_ROWS,
     FC2_ROWS,
     PASS_ROWS,
@@ -62,13 +61,12 @@ def _mirror_stage_copies(g: dict, stage: int):
     kind, row0, kc, _ = wm_stage_plan(g, stage)
     payload, words = [], []
     if kind == "fc1":
-        per_row = FC1_KCHUNK // 2 // 16
+        per_row = g["k2"] // 16
         for tid in range(THREADS):
             for i in range(g["fc1_chunks"] // THREADS):
                 idx = tid + i * THREADS
                 r, v = divmod(idx, per_row)
-                payload.append(((row0 + r) * g["k2"] + kc * (FC1_KCHUNK // 2) + v * 16,
-                                r * g["p1"] + v * 16))
+                payload.append((row0 * g["k2"] + idx * 16, r * g["p1"] + v * 16))
             for i in range(-(-g["fc1_words"] // THREADS)):
                 idx = tid + i * THREADS
                 if idx < g["fc1_words"]:

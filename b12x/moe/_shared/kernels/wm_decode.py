@@ -76,8 +76,8 @@ from b12x._lib.intrinsics import (
     st_shared_u8,
 )
 from b12x.moe._shared.kernels.wm_geometry import (
-    FC1_KCHUNK,
     FC1_ROWS,
+    NUM_WARPS,
     FC2_ROWS,
     PASS_ROWS,
     STAGES,
@@ -366,15 +366,15 @@ class MoEWeightMajorDecodeKernel:
             half = (stage // Int32(g["kchunks"])) % Int32(2)
             kc = stage % Int32(g["kchunks"])
             row0 = half * Int32(I) + cb * Int32(FC1_ROWS)
-            per_row = FC1_KCHUNK // 2 // 16
-            row_base = Int64(expert) * Int64(2 * I) + Int64(row0)
+            per_row = g["k2"] // 16
+            # FC1_ROWS consecutive rows are one contiguous span of FC1_ROWS * K/2 bytes.
+            span = (Int64(expert) * Int64(2 * I) + Int64(row0)) * Int64(g["k2"])
             for i in cutlass.range_constexpr(g["fc1_chunks"] // THREADS):
                 idx = tid + Int32(i * THREADS)
                 r = idx // Int32(per_row)
                 v = idx - r * Int32(per_row)
-                src = (row_base + Int64(r)) * Int64(g["k2"]) + Int64(kc * Int32(FC1_KCHUNK // 2) + v * Int32(16))
                 cp_async4_shared_global(slot_base + r * Int32(g["p1"]) + v * Int32(16),
-                                        get_ptr_as_int64(w13, src))
+                                        get_ptr_as_int64(w13, span + Int64(idx * Int32(16))))
             e_base = Int64(expert) * Int64(g["sf13_expert"])
             for i in cutlass.range_constexpr(-(-g["fc1_words"] // THREADS)):
                 idx = tid + Int32(i * THREADS)
@@ -524,10 +524,6 @@ class MoEWeightMajorDecodeKernel:
                 self._issue_stage(w13, sf13, w2, sf2, base, tid, iss_e, Int32(s0), Int32(s0))
             cute.arch.cp_async_commit_group()
 
-        up_acc = cute.make_rmem_tensor((4,), cutlass.Float32)
-        gate_acc = cute.make_rmem_tensor((4,), cutlass.Float32)
-        up_acc.fill(0.0)
-        gate_acc.fill(0.0)
         cur_e = Int32(0)
         n_rows = Int32(0)
         a_base = base + Int32(g["off_a"])
@@ -566,59 +562,60 @@ class MoEWeightMajorDecodeKernel:
             slot_base = base + Int32(g["off_ring"]) + (step % Int32(STAGES)) * Int32(g["slot_bytes"])
             sf_base = slot_base + Int32(g["slot_payload"])
             if s < Int32(g["fc1_stages"]):
-                cb = s // Int32(2 * g["kchunks"])
-                half = (s // Int32(g["kchunks"])) % Int32(2)
-                kc = s % Int32(g["kchunks"])
-                if kc == Int32(0):
-                    if half == Int32(0):
-                        up_acc.fill(0.0)
-                    else:
-                        gate_acc.fill(0.0)
-                b_row = warp * Int32(8) + q
+                cb = s // Int32(2)
+                half = s % Int32(2)
+                # Split-K: warp w contracts K64 slices [w * warp_k64, (w + 1) * warp_k64)
+                # of the stage's FC1_ROWS rows, then publishes its FP32 partial.
+                acc = cute.make_rmem_tensor((4,), cutlass.Float32)
+                acc.fill(0.0)
                 sf_row = q + Int32(8) * (c & Int32(1))
-                for jj in cutlass.range_constexpr(g["fc1_k64"]):
-                    k64 = kc * Int32(g["fc1_k64"]) + Int32(jj)
+                for jj in cutlass.range_constexpr(g["warp_k64"]):
+                    k64 = warp * Int32(g["warp_k64"]) + Int32(jj)
                     a_off = k64 * Int32(32) + Int32(4) * c
                     a0 = ld_shared_u32(a_base + q * Int32(g["a_stride"]) + a_off)
                     a1 = ld_shared_u32(a_base + (q + Int32(8)) * Int32(g["a_stride"]) + a_off)
                     a2 = ld_shared_u32(a_base + q * Int32(g["a_stride"]) + a_off + Int32(16))
                     a3 = ld_shared_u32(a_base + (q + Int32(8)) * Int32(g["a_stride"]) + a_off + Int32(16))
                     sfa = ld_shared_u32(as_base + sf_row * Int32(4 * g["as_words"]) + k64 * Int32(4))
-                    b_off = slot_base + b_row * Int32(g["p1"]) + Int32(jj * 32) + Int32(4) * c
+                    b_off = slot_base + q * Int32(g["p1"]) + k64 * Int32(32) + Int32(4) * c
                     b0 = ld_shared_u32(b_off)
                     b1 = ld_shared_u32(b_off + Int32(16))
-                    sfb = ld_shared_u32(sf_base + (b_row * Int32(g["fc1_k64"]) + Int32(jj)) * Int32(4))
-                    if half == Int32(0):
-                        d0, d1, d2_, d3 = nvfp4_mma_m16n8k64_f32_e2m1(
-                            up_acc[0], up_acc[1], up_acc[2], up_acc[3],
-                            a0, a1, a2, a3, b0, b1, sfa, sfb)
-                        up_acc[0] = d0
-                        up_acc[1] = d1
-                        up_acc[2] = d2_
-                        up_acc[3] = d3
-                    else:
-                        d0, d1, d2_, d3 = nvfp4_mma_m16n8k64_f32_e2m1(
-                            gate_acc[0], gate_acc[1], gate_acc[2], gate_acc[3],
-                            a0, a1, a2, a3, b0, b1, sfa, sfb)
-                        gate_acc[0] = d0
-                        gate_acc[1] = d1
-                        gate_acc[2] = d2_
-                        gate_acc[3] = d3
+                    sfb = ld_shared_u32(sf_base + (q * Int32(g["fc1_k64"]) + k64) * Int32(4))
+                    d0, d1, d2_, d3 = nvfp4_mma_m16n8k64_f32_e2m1(
+                        acc[0], acc[1], acc[2], acc[3], a0, a1, a2, a3, b0, b1, sfa, sfb)
+                    acc[0] = d0
+                    acc[1] = d1
+                    acc[2] = d2_
+                    acc[3] = d3
+                # part[half][warp][token 0..15][channel 0..7], FP32.
+                part = base + Int32(g["off_part"]) + (half * Int32(NUM_WARPS) + warp) * Int32(PASS_ROWS * FC1_ROWS * 4)
+                st_shared_f32(part + (q * Int32(FC1_ROWS) + Int32(2) * c) * Int32(4), acc[0])
+                st_shared_f32(part + (q * Int32(FC1_ROWS) + Int32(2) * c + Int32(1)) * Int32(4), acc[1])
+                st_shared_f32(part + ((q + Int32(8)) * Int32(FC1_ROWS) + Int32(2) * c) * Int32(4), acc[2])
+                st_shared_f32(part + ((q + Int32(8)) * Int32(FC1_ROWS) + Int32(2) * c + Int32(1)) * Int32(4), acc[3])
                 if half == Int32(1):
-                    if kc == Int32(g["kchunks"] - 1):
+                    cute.arch.sync_threads()
+                    if tid < Int32(PASS_ROWS * FC1_ROWS // 2):
+                        row = tid >> Int32(2)
+                        col2 = (tid & Int32(3)) * Int32(2)
                         al = alpha[cur_e].to(cutlass.Float32)
-                        acts = cute.make_rmem_tensor((4,), cutlass.Float32)
-                        for i in cutlass.range_constexpr(4):
-                            gv = al * gate_acc[i]
-                            uv = al * up_acc[i]
+                        pbase = base + Int32(g["off_part"])
+                        acts = cute.make_rmem_tensor((2,), cutlass.Float32)
+                        for e2 in cutlass.range_constexpr(2):
+                            elem = (row * Int32(FC1_ROWS) + col2 + Int32(e2)) * Int32(4)
+                            usum = ld_shared_f32(pbase + elem)
+                            gsum = ld_shared_f32(pbase + Int32(NUM_WARPS * PASS_ROWS * FC1_ROWS * 4) + elem)
+                            for w in cutlass.range_constexpr(1, NUM_WARPS):
+                                usum = usum + ld_shared_f32(pbase + Int32(w * PASS_ROWS * FC1_ROWS * 4) + elem)
+                                gsum = gsum + ld_shared_f32(
+                                    pbase + Int32((NUM_WARPS + w) * PASS_ROWS * FC1_ROWS * 4) + elem)
+                            gv = al * gsum
+                            uv = al * usum
                             sig = cute.arch.rcp_approx(
                                 cutlass.Float32(1.0) + cute.math.exp(-gv, fastmath=self.fast_math))
-                            acts[i] = gv * sig * uv
-                        col = cb * Int32(FC1_ROWS) + warp * Int32(8) + Int32(2) * c
-                        st_shared_u32(h_base + (q * Int32(I) + col) * Int32(2),
+                            acts[e2] = gv * sig * uv
+                        st_shared_u32(h_base + (row * Int32(I) + cb * Int32(FC1_ROWS) + col2) * Int32(2),
                                       pack_f32x2_to_bfloat2(acts[0], acts[1]))
-                        st_shared_u32(h_base + ((q + Int32(8)) * Int32(I) + col) * Int32(2),
-                                      pack_f32x2_to_bfloat2(acts[2], acts[3]))
                 if s == Int32(g["fc1_stages"] - 1):
                     cute.arch.sync_threads()
                     self._quantize_intermediate(fc2_gs, base, tid, cur_e)

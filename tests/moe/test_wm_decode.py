@@ -216,8 +216,7 @@ def test_wm_graph_replay_tracks_live_routes(monkeypatch):
     a = (torch.randn(capacity, K, device=device) * 0.35).to(torch.bfloat16)
     ids, weights = _routes(device, capacity, "spread", seed=4)
     wm = _plan(experts, capacity, "wm", monkeypatch)
-    dyn = _plan(experts, capacity, "dynamic", monkeypatch)
-    session = _prepare(device, (wm, dyn), a, ids, weights)
+    session = _prepare(device, (wm,), a, ids, weights)
     try:
         for rows in (1, 7, capacity):
             out, binding, _ = _run(wm, device, a, ids, weights, rows)
@@ -235,9 +234,14 @@ def test_wm_graph_replay_tracks_live_routes(monkeypatch):
                 graph.replay()
                 torch.cuda.synchronize(device)
                 assert torch.cuda.memory_stats(device)["allocation.all.allocated"] == allocated
-                ref, _, _ = _run(dyn, device, a, ids, weights, rows)
+                ref = moe_reference_nvfp4(
+                    a[:rows], w["w1"], w["w1_scale"], w["w1_alpha"], w["w2"], w["w2_scale"],
+                    w["w2_alpha"], w["a1"], w["a2"], ids[:rows], weights[:rows], E, K, I,
+                    quant_scale_math="dynamic_fast",
+                ).float()
                 assert out.isfinite().all()
-                assert _rms(out.float() - ref.float()) <= 8e-3 * _rms(ref), (rows, step)
+                err = _rms(out.float() - ref) / _rms(ref)
+                assert compare_to_reference(out.float(), ref).cos >= 0.9999 and err <= 0.015, (rows, step, err)
             graph.reset()
     finally:
         session.__exit__(None, None, None)

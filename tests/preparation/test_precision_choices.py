@@ -9,6 +9,52 @@ from b12x.preparation import DeviceIdentity, FrozenMapping
 DEVICE = DeviceIdentity("nvidia", (12, 0), 188, "SM120")
 
 
+@pytest.mark.parametrize("mode", ("auto", "quantized", "a16"))
+@pytest.mark.parametrize("cutoff", (0, 32, 128, 256))
+def test_dense_a16_cutoff_constrains_candidates_and_covers_unlisted_counts(mode, cutoff):
+    from types import SimpleNamespace
+    import torch
+    from b12x.gemm.blockscaled import BlockscaledQuery, plan_regimes
+
+    query = BlockscaledQuery(
+        recipe="nvfp4", num_tokens=128, in_features=256, padded_in_features=256,
+        out_features=128, activation_mode=mode, activation_scale_available=True,
+    )
+    plan = plan_regimes(query, exact_m=(4, 64), a16_max_tokens=cutoff)
+    states = {}
+    for rows, child in plan.variants.items():
+        expected = "a16" if rows <= cutoff else mode
+        assert child.query.activation_mode == expected
+        candidates = child.contract.eligible_plan(child.query, DEVICE).candidates
+        assert candidates
+        if expected != "auto":
+            assert all(config.mode == expected for _, config in candidates)
+        states[rows] = SimpleNamespace(query=child.query, required_workspace=rows)
+    state = plan._assemble(states, None)
+    for rows in (1, 4, 17, 31, 32, 33, 64, 127, 128):
+        selected = state.resolve(torch.empty(rows, 256, device="meta"))
+        assert selected.query.activation_mode == ("a16" if rows <= cutoff else mode)
+        assert selected.query.num_tokens >= rows
+    assert state.required_workspace == 128
+
+
+@pytest.mark.parametrize("cutoff", (-1, 1.5, True))
+def test_a16_cutoff_rejects_invalid_values(cutoff):
+    import torch
+    from b12x.gemm.blockscaled import BlockscaledQuery, plan_regimes
+    from b12x.moe.fused_moe import ActivationMode, ActivationSpec
+
+    query = BlockscaledQuery(
+        recipe="nvfp4", num_tokens=128, in_features=256,
+        padded_in_features=256, out_features=128,
+    )
+    with pytest.raises(ValueError, match="nonnegative integer"):
+        plan_regimes(query, a16_max_tokens=cutoff)
+    with pytest.raises(ValueError, match="nonnegative integer"):
+        ActivationSpec(mode=ActivationMode.A4, nonlinearity="silu",
+                       io_dtype=torch.bfloat16, a16_max_tokens=cutoff)
+
+
 @pytest.mark.parametrize("rows", (1, 8, 128))
 def test_dense_nvfp4_auto_races_a4_and_a16(rows):
     from b12x.gemm.blockscaled._tuning import BlockscaledQuery, TUNING

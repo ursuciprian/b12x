@@ -13,7 +13,7 @@ from b12x.preparation.types import FrozenMapping, MemoryRequirements, Plan, _Com
 
 from ._impl import TPMoEScratchCaps, plan_b12x_fp4_moe_weights, plan_tp_moe_scratch
 from ._tuning import FC2_TUNING, ROUTE_TUNING, MoeDecodeConfig, MoeDecodeQuery, TUNING
-from .planning import ActivationMode
+from .planning import ActivationMode, _packed_recipe
 from .weights import PreparedExperts
 from .execution import ExecutionCapacity, RoutingSpec
 
@@ -128,13 +128,21 @@ def _query(
     invocation: FrozenMapping,
 ) -> MoeDecodeQuery:
     plan = experts.plan._impl
+    quant_modes = tuple(sorted(plan.quant_modes))
+    quant_mode = (
+        "nvfp4_auto" if experts.plan.activation.mode is ActivationMode.AUTO
+        else (quant_modes[0] if len(quant_modes) == 1 else "multi")
+    )
+    cutoff = experts.plan.activation.a16_max_tokens
+    if cutoff:
+        if tokens <= cutoff:
+            quant_mode, quant_modes = "w4a16", ("w4a16",)
+        elif experts.plan.activation.mode is not ActivationMode.AUTO:
+            quant_mode = _packed_recipe(experts.plan.source, experts.plan.activation.mode)
+            quant_modes = (quant_mode,)
     return MoeDecodeQuery(
-        quant_mode=(
-            "nvfp4_auto"
-            if experts.plan.activation.mode is ActivationMode.AUTO
-            else (next(iter(plan.quant_modes)) if len(plan.quant_modes) == 1 else "multi")
-        ),
-        quant_modes=tuple(sorted(plan.quant_modes)),
+        quant_mode=quant_mode,
+        quant_modes=quant_modes,
         source_format=plan.source_format,
         activation=plan.activation,
         io_dtype=plan.io_dtype,
@@ -739,12 +747,16 @@ def variant_for(variants: Mapping[int, object], tokens: int):
 @dataclass(frozen=True)
 class _FusedMoeCapacityState:
     variants: MappingProxyType
+    a16_max_tokens: int = 0
 
     def bind(self, **kwargs):
         activations = kwargs.get("a")
         if not isinstance(activations, torch.Tensor) or activations.ndim != 2:
             raise TypeError("fused MoE binding requires a rank-two activation tensor")
-        return variant_for(self.variants, activations.shape[0]).bind(**kwargs)
+        tokens = activations.shape[0]
+        if 0 < tokens <= self.a16_max_tokens and tokens not in self.variants:
+            return self.variants[self.a16_max_tokens].bind(**kwargs)
+        return variant_for(self.variants, tokens).bind(**kwargs)
 
     def run(self, binding):
         return binding.run()
@@ -762,7 +774,8 @@ def plan(experts: PreparedExperts, *, capacity: ExecutionCapacity, routing: Rout
         raise TypeError("routing must be a RoutingSpec")
     invocation = FrozenMapping(invocation)
     controls = _control_snapshot()
-    counts = tuple(sorted({capacity.max_tokens, *capacity.warmup_token_counts}))
+    cutoff = min(experts.plan.activation.a16_max_tokens, capacity.max_tokens)
+    counts = tuple(sorted({capacity.max_tokens, *capacity.warmup_token_counts, *([cutoff] if cutoff else [])}))
     weight_payload = _weight_payload(experts)
     scale_counts = (
         int(experts._impl.a1_gscale.numel()),
@@ -859,13 +872,14 @@ def plan(experts: PreparedExperts, *, capacity: ExecutionCapacity, routing: Rout
         del device
         return _FusedMoeCapacityState(MappingProxyType({
             tokens: states[tokens] for tokens in counts
-        }))
+        }), a16_max_tokens=cutoff)
 
     return _CompositePlan(
         component_id="moe.decode",
         capacity_metadata=FrozenMapping({
             "token_counts": counts, "top_k": capacity.top_k,
             "controls": controls, "invocation": invocation,
+            **({"a16_max_tokens": cutoff} if cutoff else {}),
         }),
         variants=children, _assemble=assemble,
     )

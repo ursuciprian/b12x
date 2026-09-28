@@ -41,6 +41,18 @@ def test_capacity_state_binds_the_planned_variant_with_the_live_activations():
         state.bind(a=torch.empty(129, 16))
 
 
+def test_a16_capacity_covers_unlisted_counts_without_crossing_cutoff():
+    variants = {count: _Variant(count) for count in (4, 32, 64, 128)}
+    state = _FusedMoeCapacityState(variants, a16_max_tokens=32)
+    for rows, expected in ((1, 32), (4, 4), (17, 32), (31, 32), (32, 32),
+                           (33, 128), (64, 64), (127, 128)):
+        count, _ = state.bind(a=torch.empty(rows, 16))
+        assert count == expected
+    for rows in (0, 129):
+        with pytest.raises(ValueError):
+            state.bind(a=torch.empty(rows, 16))
+
+
 def _launches(*, direct, route_pack, route_mode="auto"):
     return _W4A16PrimaryLaunches(
         tokens=8, route_mode=route_mode, packed="packed", packed_mapped="packed_mapped",

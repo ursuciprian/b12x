@@ -86,6 +86,9 @@ from b12x.moe._shared.kernels.wm_geometry import (
 )
 
 QUANT_BATCH = 4
+# Per-CTA block rotation strides (coprime with the 40 FC1 / 40 FC2 blocks).
+STAGGER_FC1 = 7
+STAGGER_FC2 = 11
 
 
 @dsl_user_op
@@ -150,7 +153,8 @@ class MoEWeightMajorDecodeKernel:
                              num_experts=num_experts, top_k=top_k, max_tokens=max_tokens)
         self.fast_math = bool(fast_math)
         self.ids_int64 = bool(ids_int64)
-        # Benchmark-only timing probes (wrong results): nocompute, noscale, noprologue.
+        # Benchmark-only timing probes: nocompute, noscale, noprologue (wrong results) and
+        # nostagger (correct results, no per-CTA block rotation).
         self.probe = frozenset(probe)
         self.shared_words = self.g["smem_bytes"] // 4
 
@@ -357,6 +361,28 @@ class MoEWeightMajorDecodeKernel:
     # ------------------------------------------------------------------ streaming
 
     @cute.jit
+    def _fc1_block(self, i: Int32) -> Int32:
+        """FC1 channel block of the i-th FC1 block step, rotated per CTA.
+
+        CTAs stream different experts whose weights sit a whole expert (819,200 B at
+        Qwen3.8 TP2) apart. Without rotation, every CTA hits the same relative offset
+        at the same time. The blocks are independent, so the order is free.
+        """
+        g = self.g
+        if cutlass.const_expr("nostagger" in self.probe):
+            return i
+        bidx, _, _ = cute.arch.block_idx()
+        return (i + Int32(bidx) * Int32(STAGGER_FC1)) % Int32(g["ch_blocks"])
+
+    @cute.jit
+    def _fc2_block(self, i: Int32) -> Int32:
+        g = self.g
+        if cutlass.const_expr("nostagger" in self.probe):
+            return i
+        bidx, _, _ = cute.arch.block_idx()
+        return (i + Int32(bidx) * Int32(STAGGER_FC2)) % Int32(g["fc2_stages"])
+
+    @cute.jit
     def _issue_stage(self, w13: cute.Tensor, sf13: cute.Tensor, w2: cute.Tensor,
                      sf2: cute.Tensor, base: Int32, tid: Int32, expert: Int32,
                      stage: Int32, slot: Int32):
@@ -365,7 +391,7 @@ class MoEWeightMajorDecodeKernel:
         slot_base = base + Int32(g["off_ring"]) + slot * Int32(g["slot_bytes"])
         sf_base = slot_base + Int32(g["slot_payload"])
         if stage < Int32(g["fc1_stages"]):
-            cb = stage // Int32(2 * g["kchunks"])
+            cb = self._fc1_block(stage // Int32(2 * g["kchunks"]))
             half = (stage // Int32(g["kchunks"])) % Int32(2)
             kc = stage % Int32(g["kchunks"])
             row0 = half * Int32(I) + cb * Int32(FC1_ROWS)
@@ -391,7 +417,7 @@ class MoEWeightMajorDecodeKernel:
                     cp_async_u32_shared_global(sf_base + idx * Int32(4),
                                                get_ptr_as_int64(sf13, e_base + Int64(off)))
         else:
-            rb = stage - Int32(g["fc1_stages"])
+            rb = self._fc2_block(stage - Int32(g["fc1_stages"]))
             row0 = rb * Int32(FC2_ROWS)
             per_row = g["i2"] // 16
             span = (Int64(expert) * Int64(K) + Int64(row0)) * Int64(g["i2"])
@@ -567,7 +593,7 @@ class MoEWeightMajorDecodeKernel:
             sf_base = slot_base + Int32(g["slot_payload"])
             if cutlass.const_expr("nocompute" not in self.probe):
                 if s < Int32(g["fc1_stages"]):
-                    cb = s // Int32(2)
+                    cb = self._fc1_block(s // Int32(2))
                     half = s % Int32(2)
                     # Split-K: warp w contracts K64 slices [w * warp_k64, (w + 1) * warp_k64)
                     # of the stage's FC1_ROWS rows, then publishes its FP32 partial.
@@ -625,7 +651,7 @@ class MoEWeightMajorDecodeKernel:
                         cute.arch.sync_threads()
                         self._quantize_intermediate(fc2_gs, base, tid, cur_e)
                 else:
-                    rb = s - Int32(g["fc1_stages"])
+                    rb = self._fc2_block(s - Int32(g["fc1_stages"]))
                     hq_base = a_base
                     hs_base = as_base
                     sf_row = q + Int32(8) * (c & Int32(1))

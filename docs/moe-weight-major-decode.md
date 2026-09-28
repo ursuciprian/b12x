@@ -42,9 +42,11 @@ except the output atomics** (no barrier, no queue, no counters to reset).
 2. **Weight-major streaming.** Each item streams its expert's weights exactly once, as
    one uniform 11.25 KB stage sequence through a 5-slot cp.async ring (4 stages, 45 KB,
    in flight per SM):
-   - FC1: 10 channel blocks x (32 up rows, then the same 32 gate rows) x 4 K chunks of
-     640 = 80 stages; each stage is 32 rows x 320 contiguous bytes at 1280 B stride plus
-     the rows' K64 scale words from the F8_128x4 plane.
+   - FC1: 40 channel blocks x (8 up rows, then the same 8 gate rows) = 80 stages; each
+     stage is 8 full rows = one contiguous 10 KB span plus the rows' K64 scale words from
+     the F8_128x4 plane. The 4 warps split K (10 K64 slices each) and reduce their FP32
+     partials in a fixed order. The first version streamed 32 rows x 320 B quarter-rows
+     at 1280 B stride and plateaued at 185 GB/s like dynamic: LPDDR row locality.
    - FC2: 40 blocks of 64 `down` rows x the full K=320 = 40 stages; each is 10 KB fully
      contiguous plus 64 x 5 scale words.
    The ring runs across the FC1->FC2 turn and into the next item, because weight

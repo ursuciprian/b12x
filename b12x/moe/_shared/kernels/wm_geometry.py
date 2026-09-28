@@ -9,8 +9,7 @@ from __future__ import annotations
 
 # Fixed tiling (see the module docstring). The pass width is the QMMA M16 atom.
 PASS_ROWS = 16
-FC1_ROWS = 32
-FC1_KCHUNK = 640
+FC1_ROWS = 8  # one FC1 stage = 8 full contiguous w13 rows (LPDDR row locality)
 FC2_ROWS = 64
 NUM_WARPS = 4
 THREADS = NUM_WARPS * 32
@@ -22,8 +21,8 @@ def wm_geometry(*, hidden_size: int, intermediate_size: int, num_experts: int,
                 top_k: int, max_tokens: int) -> dict:
     """Static geometry shared by the kernel, the launcher and the CPU mirror tests."""
     K, I, E = int(hidden_size), int(intermediate_size), int(num_experts)
-    if K % FC1_KCHUNK or K % 128 or K % FC2_ROWS:
-        raise ValueError(f"wm decode needs hidden_size % {FC1_KCHUNK} == 0, got {K}")
+    if K % (64 * NUM_WARPS) or K % 128 or K % FC2_ROWS:
+        raise ValueError(f"wm decode needs hidden_size % {64 * NUM_WARPS} == 0, got {K}")
     if I % 64 or I % FC1_ROWS:
         raise ValueError(f"wm decode needs intermediate_size % 64 == 0, got {I}")
     if E % 32 or E > 1024:
@@ -34,8 +33,9 @@ def wm_geometry(*, hidden_size: int, intermediate_size: int, num_experts: int,
     g["passes"] = -(-max_tokens // PASS_ROWS)
     g["k2"] = K // 2                      # w13 row bytes
     g["i2"] = I // 2                      # down row bytes
-    g["kchunks"] = K // FC1_KCHUNK        # FC1 stages per row group
-    g["fc1_k64"] = FC1_KCHUNK // 64       # K64 slices per FC1 stage
+    g["kchunks"] = 1                      # FC1 stages per row group (full K per stage)
+    g["fc1_k64"] = K // 64                # K64 slices per FC1 stage
+    g["warp_k64"] = K // 64 // NUM_WARPS  # FC1 split-K: K64 slices per warp
     g["ch_blocks"] = I // FC1_ROWS
     g["fc1_stages"] = g["ch_blocks"] * 2 * g["kchunks"]
     g["fc2_k64"] = I // 64
@@ -43,9 +43,9 @@ def wm_geometry(*, hidden_size: int, intermediate_size: int, num_experts: int,
     g["spi"] = g["fc1_stages"] + g["fc2_stages"]  # stages per item
     # Shared row strides are padded by 16 B so the QMMA fragment loads of the eight
     # q rows of a warp land in distinct banks.
-    g["p1"] = FC1_KCHUNK // 2 + 16
+    g["p1"] = K // 2 + 16
     g["p2"] = g["i2"] + 16
-    g["fc1_chunks"] = FC1_ROWS * (FC1_KCHUNK // 2) // 16
+    g["fc1_chunks"] = FC1_ROWS * (K // 2) // 16
     g["fc2_chunks"] = FC2_ROWS * g["i2"] // 16
     g["fc1_words"] = FC1_ROWS * g["fc1_k64"]
     g["fc2_words"] = FC2_ROWS * g["fc2_k64"]
@@ -69,7 +69,8 @@ def wm_geometry(*, hidden_size: int, intermediate_size: int, num_experts: int,
         ("a", PASS_ROWS * g["a_stride"]),
         ("as", PASS_ROWS * 4 * g["as_words"]),
         ("h", PASS_ROWS * I * 2),
-        ("cnt", 4 * E if g["passes"] > 1 else 16),
+        # Routing counts are dead after the prologue; the FC1 split-K partials reuse them.
+        ("cnt", max(4 * E if g["passes"] > 1 else 16, 2 * NUM_WARPS * PASS_ROWS * FC1_ROWS * 4)),
         ("bm", 4 * g["bitmap_words"]),
         ("big", 4 * g["bitmap_words"]),
         ("pre", 4 * (g["bitmap_words"] + 4)),
@@ -81,6 +82,7 @@ def wm_geometry(*, hidden_size: int, intermediate_size: int, num_experts: int,
         g[f"off_{name}"] = off
         off += -(-size // 16) * 16
     g["smem_bytes"] = off
+    g["off_part"] = g["off_cnt"]
     if g["hq_stride"] * PASS_ROWS > PASS_ROWS * g["a_stride"] or \
             g["hs_stride"] * PASS_ROWS > PASS_ROWS * 4 * g["as_words"]:
         raise ValueError("wm decode intermediate does not fit the aliased A region")

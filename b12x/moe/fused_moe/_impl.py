@@ -12231,6 +12231,8 @@ def _get_wm_kernel(
         max_tokens=max_tokens,
         fast_math=fast_math,
         ids_int64=topk_ids_dtype == torch.int64,
+        # Benchmark-only timing probes; never set in serving (results are wrong).
+        probe=frozenset(filter(None, os.environ.get("B12X_WM_TIMING_PROBE", "").split(","))),
     )
     cache_key = kernel.__cache_key__
     cached = None if planning() else _WM_KERNEL_CACHE.get(cache_key)

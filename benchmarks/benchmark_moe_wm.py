@@ -88,6 +88,17 @@ def _route_sets(device, m, d):
 
 
 def bench(device, experts, backend, m, d, *, replays, shared_input):
+    # "wm:nocompute+noscale" times a probe variant of wm (wrong results, timing only).
+    backend, _, probe = backend.partition(":")
+    os.environ["B12X_WM_TIMING_PROBE"] = probe.replace("+", ",")
+    try:
+        return _bench(device, experts, backend, m, d, replays=replays, shared_input=shared_input,
+                      label=backend + (":" + probe if probe else ""))
+    finally:
+        os.environ.pop("B12X_WM_TIMING_PROBE", None)
+
+
+def _bench(device, experts, backend, m, d, *, replays, shared_input, label):
     plan = _plan(experts, m, backend, shared_input)
     a = (torch.randn(m, K, device=device) * 0.35).to(torch.bfloat16)
     weights = torch.full((m, TOPK), 1.0 / TOPK, device=device)
@@ -129,7 +140,7 @@ def bench(device, experts, backend, m, d, *, replays, shared_input):
         graph.reset()
     samples.sort()
     t = samples[len(samples) // 2]
-    return dict(backend=backend, m=m, d=d, us=t, us_min=samples[0],
+    return dict(backend=label, m=m, d=d, us=t, us_min=samples[0],
                 gbps=d * EXPERT_BYTES / (t * 1e3), rotation_mb=rotation >> 20)
 
 
@@ -144,13 +155,13 @@ def main():
     device = torch.device("cuda")
     experts = _experts(device)
     print(f"bank {E} experts x {EXPERT_BYTES} B = {E * EXPERT_BYTES / 1e6:.1f} MB")
-    print(f"{'backend':8} {'M':>3} {'D':>4} {'us/call':>9} {'min':>9} {'GB/s':>7} {'rot MB':>7}")
+    print(f"{'backend':26} {'M':>3} {'D':>4} {'us/call':>9} {'min':>9} {'GB/s':>7} {'rot MB':>7}")
     for shape in args.shapes.split(","):
         m, d = (int(v) for v in shape.split(":"))
         for backend in args.backends.split(","):
             r = bench(device, experts, backend, m, d, replays=args.replays,
                       shared_input=not args.no_shared_input)
-            print(f"{r['backend']:8} {r['m']:>3} {r['d']:>4} {r['us']:>9.1f} {r['us_min']:>9.1f} "
+            print(f"{r['backend']:26} {r['m']:>3} {r['d']:>4} {r['us']:>9.1f} {r['us_min']:>9.1f} "
                   f"{r['gbps']:>7.1f} {r['rotation_mb']:>7}", flush=True)
 
 

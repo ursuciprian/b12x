@@ -144,18 +144,21 @@ class MoEWeightMajorDecodeKernel:
     """Weight-major fused NVFP4 SiLU MoE decode (see module docstring)."""
 
     def __init__(self, *, hidden_size: int, intermediate_size: int, num_experts: int,
-                 top_k: int, max_tokens: int, fast_math: bool, ids_int64: bool):
+                 top_k: int, max_tokens: int, fast_math: bool, ids_int64: bool,
+                 probe: frozenset = frozenset()):
         self.g = wm_geometry(hidden_size=hidden_size, intermediate_size=intermediate_size,
                              num_experts=num_experts, top_k=top_k, max_tokens=max_tokens)
         self.fast_math = bool(fast_math)
         self.ids_int64 = bool(ids_int64)
+        # Benchmark-only timing probes (wrong results): nocompute, noscale, noprologue.
+        self.probe = frozenset(probe)
         self.shared_words = self.g["smem_bytes"] // 4
 
     @property
     def __cache_key__(self):
         g = self.g
         return ("wm_decode", 1, g["K"], g["I"], g["E"], g["top_k"], g["max_tokens"],
-                STAGES, self.fast_math, self.ids_int64)
+                STAGES, self.fast_math, self.ids_int64, tuple(sorted(self.probe)))
 
     @cute.jit
     def __call__(
@@ -376,7 +379,7 @@ class MoEWeightMajorDecodeKernel:
                 cp_async4_shared_global(slot_base + r * Int32(g["p1"]) + v * Int32(16),
                                         get_ptr_as_int64(w13, span + Int64(idx * Int32(16))))
             e_base = Int64(expert) * Int64(g["sf13_expert"])
-            for i in cutlass.range_constexpr(-(-g["fc1_words"] // THREADS)):
+            for i in cutlass.range_constexpr(0 if "noscale" in self.probe else -(-g["fc1_words"] // THREADS)):
                 idx = tid + Int32(i * THREADS)
                 if idx < Int32(g["fc1_words"]):
                     r = idx // Int32(g["fc1_k64"])
@@ -400,7 +403,7 @@ class MoEWeightMajorDecodeKernel:
                     cp_async4_shared_global(slot_base + r * Int32(g["p2"]) + v * Int32(16),
                                             get_ptr_as_int64(w2, span + Int64(idx * Int32(16))))
             e_base = Int64(expert) * Int64(g["sf2_expert"])
-            for i in cutlass.range_constexpr(-(-g["fc2_words"] // THREADS)):
+            for i in cutlass.range_constexpr(0 if "noscale" in self.probe else -(-g["fc2_words"] // THREADS)):
                 idx = tid + Int32(i * THREADS)
                 if idx < Int32(g["fc2_words"]):
                     r = idx // Int32(g["fc2_k64"])
@@ -541,10 +544,11 @@ class MoEWeightMajorDecodeKernel:
                 pass_idx = Int32(0)
                 if item >= d:
                     pass_idx = Int32(1)
-                self._gather_pass(ids, tw, base, tid, cur_e, pass_idx, routes)
-                cute.arch.sync_threads()
-                n_rows = Int32(ld_shared_u32(base + Int32(g["off_nrows"])))
-                self._quantize_rows(x, in_gs, base, tid, cur_e, n_rows)
+                if cutlass.const_expr("noprologue" not in self.probe):
+                    self._gather_pass(ids, tw, base, tid, cur_e, pass_idx, routes)
+                    cute.arch.sync_threads()
+                    n_rows = Int32(ld_shared_u32(base + Int32(g["off_nrows"])))
+                    self._quantize_rows(x, in_gs, base, tid, cur_e, n_rows)
 
             # Prefetch stage step + STAGES - 1 into the slot freed last iteration.
             nxt = step + Int32(STAGES - 1)
@@ -561,101 +565,102 @@ class MoEWeightMajorDecodeKernel:
 
             slot_base = base + Int32(g["off_ring"]) + (step % Int32(STAGES)) * Int32(g["slot_bytes"])
             sf_base = slot_base + Int32(g["slot_payload"])
-            if s < Int32(g["fc1_stages"]):
-                cb = s // Int32(2)
-                half = s % Int32(2)
-                # Split-K: warp w contracts K64 slices [w * warp_k64, (w + 1) * warp_k64)
-                # of the stage's FC1_ROWS rows, then publishes its FP32 partial.
-                acc = cute.make_rmem_tensor((4,), cutlass.Float32)
-                acc.fill(0.0)
-                sf_row = q + Int32(8) * (c & Int32(1))
-                for jj in cutlass.range_constexpr(g["warp_k64"]):
-                    k64 = warp * Int32(g["warp_k64"]) + Int32(jj)
-                    a_off = k64 * Int32(32) + Int32(4) * c
-                    a0 = ld_shared_u32(a_base + q * Int32(g["a_stride"]) + a_off)
-                    a1 = ld_shared_u32(a_base + (q + Int32(8)) * Int32(g["a_stride"]) + a_off)
-                    a2 = ld_shared_u32(a_base + q * Int32(g["a_stride"]) + a_off + Int32(16))
-                    a3 = ld_shared_u32(a_base + (q + Int32(8)) * Int32(g["a_stride"]) + a_off + Int32(16))
-                    sfa = ld_shared_u32(as_base + sf_row * Int32(4 * g["as_words"]) + k64 * Int32(4))
-                    b_off = slot_base + q * Int32(g["p1"]) + k64 * Int32(32) + Int32(4) * c
-                    b0 = ld_shared_u32(b_off)
-                    b1 = ld_shared_u32(b_off + Int32(16))
-                    sfb = ld_shared_u32(sf_base + (q * Int32(g["fc1_k64"]) + k64) * Int32(4))
-                    d0, d1, d2_, d3 = nvfp4_mma_m16n8k64_f32_e2m1(
-                        acc[0], acc[1], acc[2], acc[3], a0, a1, a2, a3, b0, b1, sfa, sfb)
-                    acc[0] = d0
-                    acc[1] = d1
-                    acc[2] = d2_
-                    acc[3] = d3
-                # part[half][warp][token 0..15][channel 0..7], FP32.
-                part = base + Int32(g["off_part"]) + (half * Int32(NUM_WARPS) + warp) * Int32(PASS_ROWS * FC1_ROWS * 4)
-                st_shared_f32(part + (q * Int32(FC1_ROWS) + Int32(2) * c) * Int32(4), acc[0])
-                st_shared_f32(part + (q * Int32(FC1_ROWS) + Int32(2) * c + Int32(1)) * Int32(4), acc[1])
-                st_shared_f32(part + ((q + Int32(8)) * Int32(FC1_ROWS) + Int32(2) * c) * Int32(4), acc[2])
-                st_shared_f32(part + ((q + Int32(8)) * Int32(FC1_ROWS) + Int32(2) * c + Int32(1)) * Int32(4), acc[3])
-                if half == Int32(1):
-                    cute.arch.sync_threads()
-                    if tid < Int32(PASS_ROWS * FC1_ROWS // 2):
-                        row = tid >> Int32(2)
-                        col2 = (tid & Int32(3)) * Int32(2)
-                        al = alpha[cur_e].to(cutlass.Float32)
-                        pbase = base + Int32(g["off_part"])
-                        acts = cute.make_rmem_tensor((2,), cutlass.Float32)
-                        for e2 in cutlass.range_constexpr(2):
-                            elem = (row * Int32(FC1_ROWS) + col2 + Int32(e2)) * Int32(4)
-                            usum = ld_shared_f32(pbase + elem)
-                            gsum = ld_shared_f32(pbase + Int32(NUM_WARPS * PASS_ROWS * FC1_ROWS * 4) + elem)
-                            for w in cutlass.range_constexpr(1, NUM_WARPS):
-                                usum = usum + ld_shared_f32(pbase + Int32(w * PASS_ROWS * FC1_ROWS * 4) + elem)
-                                gsum = gsum + ld_shared_f32(
-                                    pbase + Int32((NUM_WARPS + w) * PASS_ROWS * FC1_ROWS * 4) + elem)
-                            gv = al * gsum
-                            uv = al * usum
-                            sig = cute.arch.rcp_approx(
-                                cutlass.Float32(1.0) + cute.math.exp(-gv, fastmath=self.fast_math))
-                            acts[e2] = gv * sig * uv
-                        st_shared_u32(h_base + (row * Int32(I) + cb * Int32(FC1_ROWS) + col2) * Int32(2),
-                                      pack_f32x2_to_bfloat2(acts[0], acts[1]))
-                if s == Int32(g["fc1_stages"] - 1):
-                    cute.arch.sync_threads()
-                    self._quantize_intermediate(fc2_gs, base, tid, cur_e)
-            else:
-                rb = s - Int32(g["fc1_stages"])
-                hq_base = a_base
-                hs_base = as_base
-                sf_row = q + Int32(8) * (c & Int32(1))
-                dal = dalpha[cur_e].to(cutlass.Float32)
-                for t in cutlass.range_constexpr(2):
-                    nt = warp * Int32(2) + Int32(t)
-                    b_row = nt * Int32(8) + q
+            if cutlass.const_expr("nocompute" not in self.probe):
+                if s < Int32(g["fc1_stages"]):
+                    cb = s // Int32(2)
+                    half = s % Int32(2)
+                    # Split-K: warp w contracts K64 slices [w * warp_k64, (w + 1) * warp_k64)
+                    # of the stage's FC1_ROWS rows, then publishes its FP32 partial.
                     acc = cute.make_rmem_tensor((4,), cutlass.Float32)
                     acc.fill(0.0)
-                    for jj in cutlass.range_constexpr(g["fc2_k64"]):
-                        a_off = Int32(jj * 32) + Int32(4) * c
-                        a0 = ld_shared_u32(hq_base + q * Int32(g["hq_stride"]) + a_off)
-                        a1 = ld_shared_u32(hq_base + (q + Int32(8)) * Int32(g["hq_stride"]) + a_off)
-                        a2 = ld_shared_u32(hq_base + q * Int32(g["hq_stride"]) + a_off + Int32(16))
-                        a3 = ld_shared_u32(hq_base + (q + Int32(8)) * Int32(g["hq_stride"]) + a_off + Int32(16))
-                        sfa = ld_shared_u32(hs_base + sf_row * Int32(g["hs_stride"]) + Int32(jj * 4))
-                        b_off = slot_base + b_row * Int32(g["p2"]) + Int32(jj * 32) + Int32(4) * c
+                    sf_row = q + Int32(8) * (c & Int32(1))
+                    for jj in cutlass.range_constexpr(g["warp_k64"]):
+                        k64 = warp * Int32(g["warp_k64"]) + Int32(jj)
+                        a_off = k64 * Int32(32) + Int32(4) * c
+                        a0 = ld_shared_u32(a_base + q * Int32(g["a_stride"]) + a_off)
+                        a1 = ld_shared_u32(a_base + (q + Int32(8)) * Int32(g["a_stride"]) + a_off)
+                        a2 = ld_shared_u32(a_base + q * Int32(g["a_stride"]) + a_off + Int32(16))
+                        a3 = ld_shared_u32(a_base + (q + Int32(8)) * Int32(g["a_stride"]) + a_off + Int32(16))
+                        sfa = ld_shared_u32(as_base + sf_row * Int32(4 * g["as_words"]) + k64 * Int32(4))
+                        b_off = slot_base + q * Int32(g["p1"]) + k64 * Int32(32) + Int32(4) * c
                         b0 = ld_shared_u32(b_off)
                         b1 = ld_shared_u32(b_off + Int32(16))
-                        sfb = ld_shared_u32(sf_base + (b_row * Int32(g["fc2_k64"]) + Int32(jj)) * Int32(4))
+                        sfb = ld_shared_u32(sf_base + (q * Int32(g["fc1_k64"]) + k64) * Int32(4))
                         d0, d1, d2_, d3 = nvfp4_mma_m16n8k64_f32_e2m1(
                             acc[0], acc[1], acc[2], acc[3], a0, a1, a2, a3, b0, b1, sfa, sfb)
                         acc[0] = d0
                         acc[1] = d1
                         acc[2] = d2_
                         acc[3] = d3
-                    col = rb * Int32(FC2_ROWS) + nt * Int32(8) + Int32(2) * c
-                    for hr in cutlass.range_constexpr(2):
-                        row = q + Int32(8 * hr)
-                        if row < n_rows:
-                            tok = Int32(ld_shared_u32(base + Int32(g["off_tok"]) + row * Int32(4)))
-                            wv = ld_shared_f32(base + Int32(g["off_wgt"]) + row * Int32(4))
-                            y0, y1 = bfloat2_to_float2_scaled(
-                                pack_f32x2_to_bfloat2(dal * acc[2 * hr], dal * acc[2 * hr + 1]), wv)
-                            scatter_add_bf16x2(get_ptr_as_int64(out, tok * out_row + col), y0, y1)
+                    # part[half][warp][token 0..15][channel 0..7], FP32.
+                    part = base + Int32(g["off_part"]) + (half * Int32(NUM_WARPS) + warp) * Int32(PASS_ROWS * FC1_ROWS * 4)
+                    st_shared_f32(part + (q * Int32(FC1_ROWS) + Int32(2) * c) * Int32(4), acc[0])
+                    st_shared_f32(part + (q * Int32(FC1_ROWS) + Int32(2) * c + Int32(1)) * Int32(4), acc[1])
+                    st_shared_f32(part + ((q + Int32(8)) * Int32(FC1_ROWS) + Int32(2) * c) * Int32(4), acc[2])
+                    st_shared_f32(part + ((q + Int32(8)) * Int32(FC1_ROWS) + Int32(2) * c + Int32(1)) * Int32(4), acc[3])
+                    if half == Int32(1):
+                        cute.arch.sync_threads()
+                        if tid < Int32(PASS_ROWS * FC1_ROWS // 2):
+                            row = tid >> Int32(2)
+                            col2 = (tid & Int32(3)) * Int32(2)
+                            al = alpha[cur_e].to(cutlass.Float32)
+                            pbase = base + Int32(g["off_part"])
+                            acts = cute.make_rmem_tensor((2,), cutlass.Float32)
+                            for e2 in cutlass.range_constexpr(2):
+                                elem = (row * Int32(FC1_ROWS) + col2 + Int32(e2)) * Int32(4)
+                                usum = ld_shared_f32(pbase + elem)
+                                gsum = ld_shared_f32(pbase + Int32(NUM_WARPS * PASS_ROWS * FC1_ROWS * 4) + elem)
+                                for w in cutlass.range_constexpr(1, NUM_WARPS):
+                                    usum = usum + ld_shared_f32(pbase + Int32(w * PASS_ROWS * FC1_ROWS * 4) + elem)
+                                    gsum = gsum + ld_shared_f32(
+                                        pbase + Int32((NUM_WARPS + w) * PASS_ROWS * FC1_ROWS * 4) + elem)
+                                gv = al * gsum
+                                uv = al * usum
+                                sig = cute.arch.rcp_approx(
+                                    cutlass.Float32(1.0) + cute.math.exp(-gv, fastmath=self.fast_math))
+                                acts[e2] = gv * sig * uv
+                            st_shared_u32(h_base + (row * Int32(I) + cb * Int32(FC1_ROWS) + col2) * Int32(2),
+                                          pack_f32x2_to_bfloat2(acts[0], acts[1]))
+                    if s == Int32(g["fc1_stages"] - 1):
+                        cute.arch.sync_threads()
+                        self._quantize_intermediate(fc2_gs, base, tid, cur_e)
+                else:
+                    rb = s - Int32(g["fc1_stages"])
+                    hq_base = a_base
+                    hs_base = as_base
+                    sf_row = q + Int32(8) * (c & Int32(1))
+                    dal = dalpha[cur_e].to(cutlass.Float32)
+                    for t in cutlass.range_constexpr(2):
+                        nt = warp * Int32(2) + Int32(t)
+                        b_row = nt * Int32(8) + q
+                        acc = cute.make_rmem_tensor((4,), cutlass.Float32)
+                        acc.fill(0.0)
+                        for jj in cutlass.range_constexpr(g["fc2_k64"]):
+                            a_off = Int32(jj * 32) + Int32(4) * c
+                            a0 = ld_shared_u32(hq_base + q * Int32(g["hq_stride"]) + a_off)
+                            a1 = ld_shared_u32(hq_base + (q + Int32(8)) * Int32(g["hq_stride"]) + a_off)
+                            a2 = ld_shared_u32(hq_base + q * Int32(g["hq_stride"]) + a_off + Int32(16))
+                            a3 = ld_shared_u32(hq_base + (q + Int32(8)) * Int32(g["hq_stride"]) + a_off + Int32(16))
+                            sfa = ld_shared_u32(hs_base + sf_row * Int32(g["hs_stride"]) + Int32(jj * 4))
+                            b_off = slot_base + b_row * Int32(g["p2"]) + Int32(jj * 32) + Int32(4) * c
+                            b0 = ld_shared_u32(b_off)
+                            b1 = ld_shared_u32(b_off + Int32(16))
+                            sfb = ld_shared_u32(sf_base + (b_row * Int32(g["fc2_k64"]) + Int32(jj)) * Int32(4))
+                            d0, d1, d2_, d3 = nvfp4_mma_m16n8k64_f32_e2m1(
+                                acc[0], acc[1], acc[2], acc[3], a0, a1, a2, a3, b0, b1, sfa, sfb)
+                            acc[0] = d0
+                            acc[1] = d1
+                            acc[2] = d2_
+                            acc[3] = d3
+                        col = rb * Int32(FC2_ROWS) + nt * Int32(8) + Int32(2) * c
+                        for hr in cutlass.range_constexpr(2):
+                            row = q + Int32(8 * hr)
+                            if row < n_rows:
+                                tok = Int32(ld_shared_u32(base + Int32(g["off_tok"]) + row * Int32(4)))
+                                wv = ld_shared_f32(base + Int32(g["off_wgt"]) + row * Int32(4))
+                                y0, y1 = bfloat2_to_float2_scaled(
+                                    pack_f32x2_to_bfloat2(dal * acc[2 * hr], dal * acc[2 * hr + 1]), wv)
+                                scatter_add_bf16x2(get_ptr_as_int64(out, tok * out_row + col), y0, y1)
             cute.arch.sync_threads()
             step += Int32(1)
 

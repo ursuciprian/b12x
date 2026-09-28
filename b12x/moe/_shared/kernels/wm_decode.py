@@ -85,6 +85,8 @@ from b12x.moe._shared.kernels.wm_geometry import (
     wm_geometry,
 )
 
+QUANT_BATCH = 4
+
 
 @dsl_user_op
 def _popc(x: Uint32, *, loc=None, ip=None) -> Int32:
@@ -227,12 +229,18 @@ class MoEWeightMajorDecodeKernel:
             below = _lanemask_lt()
             seen = Int32(0)
             first = pass_idx * Int32(PASS_ROWS)
+            # Issue every route load before the first ballot: one latency, not one per chunk.
+            route_e = cute.make_rmem_tensor((g["route_chunks"],), cutlass.Int32)
+            for chunk in cutlass.range_constexpr(g["route_chunks"]):
+                p = Int32(chunk * 32) + lane
+                route_e[chunk] = Int32(-1)
+                if p < routes:
+                    route_e[chunk] = Int32(ids[p])
             for chunk in cutlass.range_constexpr(g["route_chunks"]):
                 p = Int32(chunk * 32) + lane
                 hit = Int32(0)
-                if p < routes:
-                    if Int32(ids[p]) == expert:
-                        hit = Int32(1)
+                if route_e[chunk] == expert:
+                    hit = Int32(1)
                 mask = _ballot(hit)
                 slot = seen + _popc(mask & below) - first
                 if hit != Int32(0):
@@ -254,31 +262,47 @@ class MoEWeightMajorDecodeKernel:
     @cute.jit
     def _quantize_rows(self, x: cute.Tensor, in_gs: cute.Tensor, base: Int32, tid: Int32,
                        expert: Int32, n_rows: Int32):
-        """Quantize the pass rows to NVFP4 into the A tile (zero rows past n_rows)."""
+        """Quantize the pass rows to NVFP4 into the A tile (zero rows past n_rows).
+
+        Thread ``tid`` owns blocks ``tid + THREADS * i``; each batch of QUANT_BATCH blocks
+        issues all of its global loads before quantizing, so the per-item prologue pays
+        a handful of load latencies instead of one per block.
+        """
         g = self.g
         K = g["K"]
         blocks = K // 16
+        per_thread = PASS_ROWS * blocks // THREADS
+        batch = QUANT_BATCH
         gs = in_gs[expert].to(cutlass.Float32)
         a_base = base + Int32(g["off_a"])
         as_base = base + Int32(g["off_as"])
-        idx = tid
-        while idx < Int32(PASS_ROWS * blocks):
-            r = idx // Int32(blocks)
-            b = idx - r * Int32(blocks)
-            dst = a_base + r * Int32(g["a_stride"]) + b * Int32(8)
-            sdst = as_base + r * Int32(4 * g["as_words"]) + b
-            if r < n_rows:
-                tok = Int32(ld_shared_u32(base + Int32(g["off_tok"]) + r * Int32(4)))
-                src = get_ptr_as_int64(x, tok * Int32(K) + b * Int32(16))
+        for grp in cutlass.range_constexpr(per_thread // batch):
+            raw = cute.make_rmem_tensor((batch * 8,), cutlass.Uint32)
+            for u in cutlass.range_constexpr(batch):
+                idx = tid + Int32((grp * batch + u) * THREADS)
+                r = idx // Int32(blocks)
+                b = idx - r * Int32(blocks)
+                for w in cutlass.range_constexpr(8):
+                    raw[u * 8 + w] = Uint32(0)
+                if r < n_rows:
+                    tok = Int32(ld_shared_u32(base + Int32(g["off_tok"]) + r * Int32(4)))
+                    src = get_ptr_as_int64(x, tok * Int32(K) + b * Int32(16))
+                    for h in cutlass.range_constexpr(2):
+                        v0, v1, v2, v3 = ld_global_v4_u32(src + Int64(16 * h))
+                        raw[u * 8 + 4 * h] = v0
+                        raw[u * 8 + 4 * h + 1] = v1
+                        raw[u * 8 + 4 * h + 2] = v2
+                        raw[u * 8 + 4 * h + 3] = v3
+            for u in cutlass.range_constexpr(batch):
+                idx = tid + Int32((grp * batch + u) * THREADS)
+                r = idx // Int32(blocks)
+                b = idx - r * Int32(blocks)
                 values = cute.make_rmem_tensor((16,), cutlass.Float32)
                 block_max = cutlass.Float32(0.0)
-                for half in cutlass.range_constexpr(2):
-                    v0, v1, v2, v3 = ld_global_v4_u32(src + Int64(16 * half))
-                    words = (v0, v1, v2, v3)
-                    for w in cutlass.range_constexpr(4):
-                        lo, hi = bfloat2_to_float2_scaled(words[w], cutlass.Float32(1.0))
-                        values[8 * half + 2 * w] = lo
-                        values[8 * half + 2 * w + 1] = hi
+                for w in cutlass.range_constexpr(8):
+                    lo, hi = bfloat2_to_float2_scaled(raw[u * 8 + w], cutlass.Float32(1.0))
+                    values[2 * w] = lo
+                    values[2 * w + 1] = hi
                 for e in cutlass.range_constexpr(16):
                     block_max = fmax_f32(block_max, fabs_f32(values[e]))
                 packed = Uint64(0)
@@ -287,14 +311,12 @@ class MoEWeightMajorDecodeKernel:
                     packed, scale = quantize_block_fp4_fast(values, block_max, gs)
                 else:
                     packed, scale = quantize_block_fp4(values, block_max, gs)
+                # Rows past n_rows are all-zero blocks, which quantize to zero payload
+                # and a zero scale byte.
+                dst = a_base + r * Int32(g["a_stride"]) + b * Int32(8)
                 st_shared_u32(dst, Uint32(packed & Uint64(0xFFFFFFFF)))
                 st_shared_u32(dst + Int32(4), Uint32(packed >> Uint64(32)))
-                st_shared_u8(sdst, scale)
-            else:
-                st_shared_u32(dst, Uint32(0))
-                st_shared_u32(dst + Int32(4), Uint32(0))
-                st_shared_u8(sdst, Uint8(0))
-            idx += Int32(THREADS)
+                st_shared_u8(as_base + r * Int32(4 * g["as_words"]) + b, scale)
 
     @cute.jit
     def _quantize_intermediate(self, fc2_gs: cute.Tensor, base: Int32, tid: Int32,

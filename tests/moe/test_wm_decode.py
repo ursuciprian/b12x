@@ -16,12 +16,15 @@ independent rounding can therefore differ by about sqrt(2) times that. The check
 require:
 
 - wm is no further from the oracle than dynamic is, within 5%;
-- the RMS of wm minus dynamic stays under 8e-3 of the output RMS;
+- the RMS of wm minus dynamic stays under max(1.25 x dynamic's own run-to-run
+  difference, 1.5 x the two kernels' combined oracle distance); on GB10 dynamic vs
+  dynamic alone measures about 9e-3 at one row;
 - the oracle metrics use the thresholds of the existing dynamic tests.
 """
 
 from __future__ import annotations
 
+import math
 import os
 
 import pytest
@@ -178,7 +181,7 @@ def test_wm_matches_dynamic(capacity, per_expert_scales, monkeypatch):
                 ctx = (pattern, rows, exact, diff, noise, err_w, err_d)
                 assert cos >= 0.9999 and err_w <= 0.015, ctx
                 assert err_w <= 1.05 * err_d + 1e-4, ctx
-                assert diff <= 8e-3, ctx
+                assert diff <= max(1.25 * noise, 1.5 * math.hypot(err_w, err_d)), ctx
         for line in report:
             print("wm-vs-dynamic %-9s rows=%2d exact=%.4f diff=%.2e self=%.2e "
                   "err_wm=%.2e err_dyn=%.2e" % line)

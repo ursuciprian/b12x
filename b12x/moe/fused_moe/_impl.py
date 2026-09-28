@@ -12343,9 +12343,17 @@ def _launch_wm(
         ptr(cutlass.Float32, weights.w2_alpha, 4),
         ptr(cutlass.BFloat16, scatter_output),
         Int32(m),
-        Int32(get_num_sm(a.device)),
+        Int32(_wm_grid(a.device)),
         current_cuda_stream(),
     )
+
+
+def _wm_grid(device) -> int:
+    """CTAs of the wm launch: every SM by default. B12X_MOE_WM_GRID caps it, leaving SMs
+    free for kernels on side streams (e.g. shared experts) that overlap the routed MoE."""
+    sms = get_num_sm(device)
+    cap = os.environ.get("B12X_MOE_WM_GRID", "").strip()
+    return max(1, min(sms, int(cap))) if cap else sms
 
 
 def _get_tiny_decode_kernel(

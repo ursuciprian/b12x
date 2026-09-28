@@ -13,7 +13,6 @@ full buffer once per call, so L2 cannot hold the working set.
 
 from __future__ import annotations
 
-import itertools
 
 import cutlass
 import cutlass.cute as cute
@@ -22,6 +21,7 @@ from cutlass.cutlass_dsl import Int32, Int64
 
 from b12x._lib.intrinsics import (
     cp_async4_shared_global,
+    cp_async_u32_shared_global,
     cp_async_bulk_g2s_mbar,
     get_ptr_as_int64,
     shared_ptr_to_u32,
@@ -32,14 +32,36 @@ BYTES = 1 << 30
 
 
 class StreamProbe:
-    def __init__(self, threads, stages, chunk):
+    def __init__(self, threads, stages, chunk, interleave=False, gather4=0):
         self.threads, self.stages, self.chunk = threads, stages, chunk
-        self.words = stages * chunk // 4
+        self.interleave, self.gather4 = interleave, gather4
+        self.words = stages * (chunk + 4 * gather4) // 4
+        self.slot = chunk + 4 * gather4
 
     @cute.jit
     def __call__(self, src_ptr: cute.Pointer, n_chunks: Int32, grid: Int32, stream):
         src = cute.make_tensor(src_ptr, cute.make_layout(Int64(BYTES)))
         self.kernel(src, n_chunks).launch(grid=(grid, 1, 1), block=[self.threads, 1, 1], stream=stream)
+
+    @cute.jit
+    def _issue(self, src, base, tid, first, step, slot, per_thread):
+        chunk_idx = first + step
+        if cutlass.const_expr(self.interleave):
+            # Alternate between the CTA's region halves, like wm's up/gate/down streams.
+            # Two streams 400 KB apart, each 40 chunks long, every chunk read once.
+            half = step & Int32(1)
+            j = step >> Int32(1)
+            chunk_idx = first + ((j // Int32(40)) * Int32(2) + half) * Int32(40) + j % Int32(40)
+        dst = base + slot * Int32(self.slot)
+        for i in cutlass.range_constexpr(per_thread):
+            off = Int64(chunk_idx) * Int64(self.chunk) + Int64((tid + Int32(i * self.threads)) * Int32(16))
+            cp_async4_shared_global(dst + (tid + Int32(i * self.threads)) * Int32(16), get_ptr_as_int64(src, off))
+        for i in cutlass.range_constexpr(-(-self.gather4 // self.threads)):
+            w = tid + Int32(i * self.threads)
+            if w < Int32(self.gather4):
+                # wm-like scale gather: 4 B at a 512 B stride per K64 group, 16 B per row.
+                off = Int64(chunk_idx) * Int64(self.chunk) + Int64((w % Int32(40)) * Int32(512) + (w // Int32(40)) * Int32(16))
+                cp_async_u32_shared_global(dst + Int32(self.chunk) + w * Int32(4), get_ptr_as_int64(src, off))
 
     @cute.kernel
     def kernel(self, src: cute.Tensor, n_chunks: Int32):
@@ -60,20 +82,14 @@ class StreamProbe:
 
         for s0 in cutlass.range_constexpr(self.stages - 1):
             if Int32(s0) < per_cta:
-                for i in cutlass.range_constexpr(per_thread):
-                    off = Int64(first + Int32(s0)) * Int64(self.chunk) + Int64((tid + Int32(i * self.threads)) * Int32(16))
-                    cp_async4_shared_global(base + Int32(s0 * self.chunk) + (tid + Int32(i * self.threads)) * Int32(16),
-                                            get_ptr_as_int64(src, off))
+                self._issue(src, base, tid, first, Int32(s0), Int32(s0), per_thread)
             cute.arch.cp_async_commit_group()
         step = Int32(0)
         while step < per_cta:
             nxt = step + Int32(self.stages - 1)
             if nxt < per_cta:
                 slot = nxt % Int32(self.stages)
-                for i in cutlass.range_constexpr(per_thread):
-                    off = Int64(first + nxt) * Int64(self.chunk) + Int64((tid + Int32(i * self.threads)) * Int32(16))
-                    cp_async4_shared_global(base + slot * Int32(self.chunk) + (tid + Int32(i * self.threads)) * Int32(16),
-                                            get_ptr_as_int64(src, off))
+                self._issue(src, base, tid, first, nxt, slot, per_thread)
             cute.arch.cp_async_commit_group()
             cute.arch.cp_async_wait_group(self.stages - 1)
             cute.arch.sync_threads()
@@ -162,22 +178,17 @@ def main():
     t = timed(lambda: buf.view(torch.float32).amax())
     print(f"torch f32 amax : {BYTES / t / 1e9:.1f} GB/s", flush=True)
     ptr = make_ptr(cutlass.Uint8, buf.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
-    print(f"{'kind':>8} {'thr':>4} {'stg':>4} {'chunk':>6} {'cta/sm':>6} {'inflight KB/SM':>15} {'GB/s':>7}")
-    for kind, threads, stages, chunk, per_sm in itertools.product(
-            ("cp.async", "tma"), (128, 256), (3, 5, 8), (4096, 11264, 16384), (1, 2)):
-        if stages * chunk * per_sm > 200 * 1024 or chunk // 16 % threads:
-            continue
-        if kind == "tma" and threads == 256:
-            continue
-        probe = (StreamProbe if kind == "cp.async" else TmaStreamProbe)(threads, stages, chunk)
-        n_chunks = BYTES // chunk
-        grid = sms * per_sm
-        n_chunks -= n_chunks % grid
-        compiled = cute.compile(probe, ptr, Int32(n_chunks), Int32(grid), current_cuda_stream())
-        t = timed(lambda: compiled(ptr, Int32(n_chunks), Int32(grid), current_cuda_stream()))
-        print(f"{kind:>8} {threads:>4} {stages:>4} {chunk:>6} {per_sm:>6} {(stages - 1) * chunk * per_sm / 1024:>15.0f} "
-              f"{n_chunks * chunk / t / 1e9:>7.1f}", flush=True)
-
+    print(f"{'mode':>18} {'grid':>5} {'GB/s':>7}")
+    chunk, stages = 10240, 5
+    for mode, interleave, gather in (("seq", False, 0), ("interleave", True, 0),
+                                     ("seq+gather320", False, 320), ("interleave+gather320", True, 320)):
+        probe = StreamProbe(128, stages, chunk, interleave=interleave, gather4=gather)
+        for grid in (16, 24, 33, 48):
+            n_chunks = BYTES // chunk
+            n_chunks -= n_chunks % (grid * 80)
+            compiled = cute.compile(probe, ptr, Int32(n_chunks), Int32(grid), current_cuda_stream())
+            t = timed(lambda: compiled(ptr, Int32(n_chunks), Int32(grid), current_cuda_stream()))
+            print(f"{mode:>18} {grid:>5} {n_chunks * chunk / t / 1e9:>7.1f}", flush=True)
 
 if __name__ == "__main__":
     main()

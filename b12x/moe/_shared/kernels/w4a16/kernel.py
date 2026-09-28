@@ -10379,8 +10379,8 @@ def _w4a16_fused_moe_launch_flat(
     if collect_activation_amax and activation_amax is None:
         raise ValueError("activation_amax is required for calibrated W4A16 launch")
     activation_amax_arg = (
-        activation_amax.view(-1) if activation_amax is not None else w13_global_scale
-    )
+        activation_amax if activation_amax is not None else w13_global_scale
+    ).view(-1)
     if intermediate_rotation:
         if rot_scales is None:
             raise ValueError("intermediate_rotation launch requires rot_scales")

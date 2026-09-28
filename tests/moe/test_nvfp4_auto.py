@@ -154,8 +154,9 @@ def test_uniform_nvfp4_a16_does_not_retain_source_scales():
 @pytest.mark.parametrize("num_experts,hidden_size,intermediate_size,topk", (
     (8, 256, 256, 2), (256, 6144, 256, 8),
 ))
+@pytest.mark.parametrize("counts", ((1, 2, 4, 7, 8), (1, 2, 3, 4, 5, 6, 8)))
 def test_auto_native_decode_retains_launches_and_replays_shared_storage(
-    tmp_path, monkeypatch, num_experts, hidden_size, intermediate_size, topk,
+    tmp_path, monkeypatch, num_experts, hidden_size, intermediate_size, topk, counts,
 ):
     from b12x.preparation import PreparationSession, PreparedCall
     from b12x.moe._shared.kernels.w4a16 import kernel
@@ -189,7 +190,6 @@ def test_auto_native_decode_retains_launches_and_replays_shared_storage(
     ):
         assert tensor.data_ptr() == original.data_ptr()
     originals = [tensor.clone() for tensor in raw]
-    counts = (1, 2, 4, 8)
     x = torch.randn(8, hidden_size, dtype=torch.bfloat16, device="cuda") * 0.25
     ids = torch.stack([torch.randperm(num_experts, device="cuda")[:topk] for _ in range(8)])
     probabilities = torch.softmax(torch.randn(8, topk, device="cuda"), dim=-1)
@@ -215,7 +215,8 @@ def test_auto_native_decode_retains_launches_and_replays_shared_storage(
             name="native-auto", prepare_calls={m: make_call(m) for m in counts},
         ),))
         bindings = []
-        for m in (*counts, 3):
+        unprepared_rows = next(rows for rows in range(1, 8) if rows not in counts)
+        for m in (*counts, unprepared_rows):
             state = execution.variants[m if m in counts else 8].prepared.state
             scratch = tuple(torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
                             for spec in state.scratch.scratch_specs())

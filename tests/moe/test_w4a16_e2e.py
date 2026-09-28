@@ -2687,9 +2687,11 @@ def test_w4a16_modelopt_nvfp4_prepare_moe_matches_oracle(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("prepare_native", [False, True])
 @pytest.mark.parametrize("w13_layout", ["up_gate", "gate_up"])
+@pytest.mark.parametrize("parameter_scales", [False, True])
 def test_w4a16_modelopt_nvfp4_explicit_w13_layout_matches_oracle(
     prepare_native: bool,
     w13_layout: str,
+    parameter_scales: bool,
 ) -> None:
     """W13 physical order is an explicit input, independent of source_format."""
     torch.manual_seed(20260525 + (1000 if prepare_native else 0))
@@ -2703,6 +2705,9 @@ def test_w4a16_modelopt_nvfp4_explicit_w13_layout_matches_oracle(
         activation=activation,
     )
     w13, w13_blockscale, w13_global_scale, w2, w2_blockscale, w2_global_scale = weights
+    if parameter_scales:
+        w13_global_scale = torch.nn.Parameter(w13_global_scale, requires_grad=False)
+        w2_global_scale = torch.nn.Parameter(w2_global_scale, requires_grad=False)
     x = (torch.randn(m, hidden_size, device="cuda") * 0.25).to(torch.bfloat16)
     topk_ids = torch.randint(0, experts, (m, topk), device="cuda", dtype=torch.int32)
     topk_weights = torch.softmax(torch.randn(m, topk, device="cuda"), dim=-1)

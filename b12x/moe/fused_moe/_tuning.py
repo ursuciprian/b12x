@@ -250,6 +250,11 @@ def validate_moe_decode_config(
             raise ValueError("W4A16 queries require the W4A16 backend")
         if config.w4a16_route_mode not in {"direct", "packed"}:
             raise ValueError("W4A16 route mode must be 'direct' or 'packed'")
+        if config.w4a16_route_mode == "direct":
+            from ._impl import _w4a16_direct_routing_supported
+
+            if not _w4a16_direct_routing_supported(query):
+                raise ValueError("W4A16 direct routing does not support this concrete query")
     else:
         if config.backend == "w4a16":
             raise ValueError("the W4A16 backend requires quant_mode='w4a16'")
@@ -308,7 +313,6 @@ def _materialize_tuning(query, device, choice):
         _dynamic_direct_routing_selected,
         _dynamic_kernel_intermediate_size,
         _policy_micro_supported,
-        _w4a16_direct_routing_supported,
     )
 
     config = MoeDecodeConfig.from_config(choice)
@@ -351,8 +355,6 @@ def _materialize_tuning(query, device, choice):
             )
         except RuntimeError as exc:
             raise ValueError(str(exc)) from exc
-    if config.backend == "w4a16" and config.w4a16_route_mode == "direct" and not _w4a16_direct_routing_supported(query):
-        raise ValueError("W4A16 direct routing does not support this concrete query")
     return config
 
 
@@ -457,6 +459,9 @@ TUNING = TuningContract(
     validate_query=_validate_query,
     validate_config=validate_moe_decode_config,
     default_config=_default_config,
+    # r7: kept at 4 (upstream 57f35723 bumps to 5): only W4A16 queries gain candidates here,
+    # and no W4A16 moe.decode decision was ever cached on this deployment, so NVFP4 (A4)
+    # selections from b1.3 stay valid and non-A16 arms keep their tuned kernels.
     candidate_contract_version=4,
     knobs=(
         Knob(name="backend", values=("micro", "dynamic", "w4a16"), binding=ParameterBinding.COMPILE),

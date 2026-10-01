@@ -456,6 +456,10 @@ def test_recorded_selections_stay_eligible(key):
     if key[0] == "moe.decode":
         # The recorded programs use unshared input and monolithic NVFP4 execution.
         values.update(nvfp4_share_input=False, nvfp4_materialize_intermediate=False)
+    if key[0] == "gemm.blockscaled_precision":
+        # Selections recorded before the GEMV knobs leave them inactive.
+        values.setdefault("gemv_split", None)
+        values.setdefault("gemv_ctas", None)
     assignment = FrozenMapping(values)
     contract.parameter_space(query, IDENTITY).validate(assignment)
     contract.lower(query, IDENTITY, assignment)
@@ -549,7 +553,7 @@ def test_a16_wide_tile_needs_more_than_one_n_tile():
         out_features=48,
     )
     space = TUNING.parameter_space(narrow, IDENTITY)
-    assignment = dict(mode="a16", tile_n=64, tile_k=64, split_k=1)
+    assignment = dict(mode="a16", tile_n=64, tile_k=64, split_k=1, gemv_split=None, gemv_ctas=None)
     space.validate(assignment)
     with pytest.raises(ValueError, match="predicates"):
         space.validate({**assignment, "tile_n": 128})

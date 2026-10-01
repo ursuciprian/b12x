@@ -14,7 +14,9 @@ def _execute(source, values, scales, global_scale, activation_scale, workspace, 
     resolve = getattr(state, "resolve", None)
     if resolve is not None:
         state = resolve(source)
-    if required_mode != "any" and state.config.mode != required_mode:
+    if required_mode != "any" and state.config.mode != required_mode and not (
+        required_mode == "a16" and state.config.mode == "gemv"
+    ):
         raise ValueError("this entry point requires an A16 prepared plan")
     if global_scale_kind != state.query.global_scale_kind:
         raise ValueError("weight scale semantics differ from prepared invocation")

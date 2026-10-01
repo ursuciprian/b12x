@@ -48,6 +48,15 @@ def compile_packed(query_payload, config_payload, dense_payload, ordinal, sm_cou
     config = BlockscaledConfig.from_config(FrozenMapping(config_payload))
     fp4 = query.recipe == "nvfp4"
     with torch.cuda.device(ordinal):
+        if config.mode == "gemv":
+            from . import _gemv
+            programs = {"gemm": _gemv.compile_gemv(
+                query.out_features, query.in_features, query.padded_in_features, query.num_tokens,
+                config.gemv_split, config.gemv_ctas, sm_count, ordinal,
+            )}
+            if config.gemv_split > 1:
+                programs["reduce"] = _reduce.compile_reduce(query.out_features, config.gemv_split, ordinal)
+            return programs
         if config.mode == "a16":
             bn, bk, slices = effective_a16_config(query, config)
             gemm = dense._get_compiled_dense_gemm(
@@ -107,6 +116,9 @@ def _owned_bytes(query, config):
 
 
 def _workspace_bytes(query, config):
+    if config.mode == "gemv":
+        split = config.gemv_split
+        return split * query.num_tokens * query.out_features * 4 if split > 1 else 0
     if config.mode == "a16":
         slices = effective_a16_config(query, config)[2]
         return slices * query.num_tokens * query.out_features * 4 if slices > 1 else 0
@@ -214,6 +226,20 @@ class _PackedExecutionState:
                     raise ValueError("workspace is smaller than the prepared requirement")
                 if any(_overlap(workspace, tensor) for tensor in (*reads, out)):
                     raise ValueError("workspace must not overlap packed operands/output")
+            if config.mode == "gemv":
+                import cutlass
+                import cutlass.cute as cute
+                slices = config.gemv_split
+                target = out if slices == 1 else workspace[:self.required_workspace].view(torch.float32)
+                self.programs["gemm"](source.view(m, q.in_features), values.view(torch.uint8),
+                                      scale_bytes, target, m)
+                if slices > 1:
+                    self.programs["reduce"](
+                        make_ptr(cutlass.Float32, target.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+                        make_ptr(cutlass.BFloat16, out.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+                        m, current_cuda_stream(),
+                    )
+                return out
             if config.mode == "a16":
                 import cutlass
                 import cutlass.cute as cute
@@ -269,7 +295,7 @@ def _plan_bf16(query: BlockscaledQuery, *, invocation=FrozenMapping(), override=
     def inner(config, device):
         key = (config, device.identity)
         if key not in lowerings:
-            lowerings[key] = None if config.mode == "a16" else _dense_lowering(query, config, device)
+            lowerings[key] = None if config.mode in ("a16", "gemv") else _dense_lowering(query, config, device)
         return lowerings[key]
 
     def compile_jobs(config, device):
@@ -304,7 +330,7 @@ def _plan_bf16(query: BlockscaledQuery, *, invocation=FrozenMapping(), override=
         programs = compile_packed(TUNING.encode_query(query), config.to_dict(), None if p is None else p.to_dict(), device.ordinal, device.identity.sm_count, device.identity.compute_capability)
         resolved_device = torch.device("cuda", device.ordinal)
         core = None if p is None else dense._DenseExecutionState(p, resolved_device, programs["gemm"], programs.get("reduce"), dense._cached_alpha_one(resolved_device) if p.alpha_is_one else None)
-        offsets = None if config.mode == "a16" or functional_mxfp8_quantization(query, config) else _layout(query.num_tokens, query.out_features, query.padded_in_features, query.recipe == "nvfp4", (64, 64, 1))
+        offsets = None if config.mode in ("a16", "gemv") or functional_mxfp8_quantization(query, config) else _layout(query.num_tokens, query.out_features, query.padded_in_features, query.recipe == "nvfp4", (64, 64, 1))
         needed = _workspace_bytes(query, config)
         workspace = bases = None
         if query.workspace_form == "owned":

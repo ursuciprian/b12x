@@ -5,7 +5,22 @@ from dataclasses import asdict, dataclass, replace
 
 from b12x.preparation import BackendConfig, FrozenMapping, make_fixed_contract
 from b12x.preparation.tuning import Knob, ParameterBinding, ParameterSpace, TuningContract
-from b12x.gemm._tuning import _codegen_snapshot
+from b12x.gemm._tuning import _codegen_snapshot as _dense_codegen_snapshot
+from b12x._lib.env import env_flag
+from . import _gemv
+
+# B12X_DENSE_GEMV=1 adds the weight-only MXFP8 GEMV (mode "gemv") to the
+# decode-sized candidate space and makes it the untuned default. It enters the
+# query's codegen snapshot only when set, so tuning caches stay keyed by it and
+# an unset knob leaves every existing query, cache and corpus unchanged.
+_DENSE_GEMV = env_flag("DENSE_GEMV")
+
+
+def _codegen_snapshot():
+    snapshot = _dense_codegen_snapshot()
+    if not _DENSE_GEMV:
+        return snapshot
+    return FrozenMapping({**snapshot, "dense_gemv": True})
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -38,11 +53,14 @@ class BlockscaledConfig:
     tile_n: int | None = None
     tile_k: int | None = None
     split_k: int | None = None
+    gemv_split: int | None = None
+    gemv_ctas: int | None = None
 
     @classmethod
     def from_config(cls, payload):
-        if set(payload) != {"mode", "tile_n", "tile_k", "split_k"}:
-            raise ValueError("packed precision config requires mode and the three nullable A16 knobs")
+        keys = set(payload)
+        if not {"mode", "tile_n", "tile_k", "split_k"} <= keys <= set(cls.__dataclass_fields__):
+            raise ValueError("packed precision config requires mode and the nullable A16/GEMV knobs")
         return cls(**dict(payload))
 
     def to_dict(self):
@@ -88,7 +106,28 @@ def _automatic_a16(query, device):
     )
 
 
+def gemv_eligible(query, device):
+    """Static coordinates under which the MXFP8 GEMV may serve a query."""
+    return (
+        _DENSE_GEMV and device is not None
+        and device.compute_capability in ((12, 0), (12, 1))
+        and query.recipe == "mxfp8" and query.activation_mode in ("auto", "a16")
+        and query.in_features % 32 == 0 and query.padded_in_features % 32 == 0
+        and query.source_contiguous and query.source_aligned
+        and query.num_tokens <= _gemv.MAX_ROWS
+    )
+
+
+def gemv_geometry(query, config, device):
+    return _gemv.geometry(query.out_features, query.in_features, query.num_tokens,
+                          config.gemv_split, config.gemv_ctas, device.sm_count)
+
+
 def _default_config(query, device):
+    if gemv_eligible(query, device):
+        split = _gemv.default_split(query.out_features, query.in_features, query.num_tokens, device.sm_count)
+        if split is not None:
+            return BlockscaledConfig(mode="gemv", gemv_split=split, gemv_ctas=2)
     if query.activation_mode == "quantized":
         return BlockscaledConfig(mode="quantized")
     if _automatic_a16(query, device):
@@ -108,10 +147,26 @@ def effective_a16_config(query, config):
 
 
 def _validate_config(query, config, device):
-    if not isinstance(config, BlockscaledConfig) or config.mode not in ("a16", "quantized"):
+    if not isinstance(config, BlockscaledConfig) or config.mode not in ("a16", "quantized", "gemv"):
         raise ValueError("invalid packed precision configuration")
-    if query.activation_mode != "auto" and config.mode != query.activation_mode:
+    # The GEMV keeps BF16 activations, so it satisfies an A16 request.
+    if query.activation_mode != "auto" and config.mode != query.activation_mode and not (
+        config.mode == "gemv" and query.activation_mode == "a16"
+    ):
         raise ValueError("configuration conflicts with caller activation precision")
+    if config.mode == "gemv":
+        if any(value is not None for value in (config.tile_n, config.tile_k, config.split_k)):
+            raise ValueError("GEMV execution has no A16 tile knobs")
+        if config.gemv_split not in _gemv.SPLITS or config.gemv_ctas not in _gemv.CTAS_PER_SM:
+            raise ValueError("invalid GEMV launch geometry")
+        if not gemv_eligible(query, device) or gemv_geometry(query, config, device) is None:
+            raise ValueError("GEMV cannot serve this query")
+        if query.workspace_nbytes is not None and config.gemv_split > 1:
+            if query.workspace_nbytes < config.gemv_split * query.num_tokens * query.out_features * 4:
+                raise ValueError("caller workspace is too small for GEMV split-K")
+        return
+    if config.gemv_split is not None or config.gemv_ctas is not None:
+        raise ValueError("GEMV knobs require GEMV execution")
     if config.mode == "a16":
         if (type(config.tile_n) is not int or config.tile_n not in (64, 128)
                 or type(config.tile_k) is not int or config.tile_k not in (64, 128)
@@ -151,10 +206,11 @@ def _validate_config(query, config, device):
 
 
 def _tuning_parameters(query, device):
-    del device
     return ParameterSpace.create(
         TUNING.knobs,
-        values={"mode": ("a16", "quantized") if query.activation_mode == "auto" else (query.activation_mode,)},
+        values={"mode": (
+            ("a16", "quantized") if query.activation_mode == "auto" else (query.activation_mode,)
+        ) + (("gemv",) if gemv_eligible(query, device) else ())},
         predicates=(
             # N at or below 64 is a single N tile for either tile width, and the
             # 128-wide tile issues twice the MMA work over the same columns.
@@ -170,12 +226,15 @@ def _tuning_parameters(query, device):
 def _equivalence(query, device, config):
     if config.mode == "quantized":
         return {"mode": "quantized"}
+    if config.mode == "gemv":
+        return {"mode": "gemv", "split": config.gemv_split,
+                "ctas": gemv_geometry(query, config, device)["ctas"]}
     n, k, split = effective_a16_config(query, config)
     return {"mode": "a16", "tile_n": n, "tile_k": k, "split_k": split}
 
 
 TUNING = TuningContract(
-    component_id="gemm.blockscaled_precision", query_schema_version=4, config_schema_version=2,
+    component_id="gemm.blockscaled_precision", query_schema_version=4, config_schema_version=3,
     query_fields=frozenset(BlockscaledQuery.__dataclass_fields__),
     config_fields=frozenset(BlockscaledConfig.__dataclass_fields__),
     encode_query=lambda query: {name: getattr(query, name) for name in query.__dataclass_fields__},
@@ -183,10 +242,12 @@ TUNING = TuningContract(
     validate_query=_validate_query, validate_config=_validate_config, default_config=_default_config,
     candidate_contract_version=5,
     knobs=(
-        Knob(name="mode", values=("a16", "quantized"), binding=ParameterBinding.COMPILE),
+        Knob(name="mode", values=("a16", "quantized", "gemv"), binding=ParameterBinding.COMPILE),
         Knob(name="tile_n", values=(64, 128), when=FrozenMapping({"mode": "a16"})),
         Knob(name="tile_k", values=(64, 128), when=FrozenMapping({"mode": "a16"})),
         Knob(name="split_k", values=(1, 2, 4, 8), when=FrozenMapping({"mode": "a16"})),
+        Knob(name="gemv_split", values=_gemv.SPLITS, when=FrozenMapping({"mode": "gemv"})),
+        Knob(name="gemv_ctas", values=_gemv.CTAS_PER_SM, when=FrozenMapping({"mode": "gemv"})),
     ),
     parameters=_tuning_parameters,
     equivalence_key=_equivalence,

@@ -10,18 +10,38 @@ from __future__ import annotations
 # Fixed tiling (see the module docstring). The pass width is the QMMA M16 atom.
 PASS_ROWS = 16
 FC1_ROWS = 8  # one FC1 stage = 8 full contiguous w13 rows (LPDDR row locality)
-FC2_ROWS = 64
+FC2_ROWS = 64  # default FC2 stage rows (TP=2 widths); see RING_CHOICES
 NUM_WARPS = 4
 THREADS = NUM_WARPS * 32
-STAGES = 5
+STAGES = 5  # default ring slots
 MAX_SMEM_BYTES = 101376  # SM120/SM121 opt-in per-block limit
+# (FC2 rows, ring slots), first that fits shared memory wins. I=320 (TP=2) keeps
+# (64, 5); I=640 (TP=1, full intermediate) needs 20 KB FC2 stages at 64 rows, so it
+# takes 32-row FC2 stages (10 KB, still fully contiguous) and a 4-slot ring.
+RING_CHOICES = ((64, 5), (32, 5), (32, 4))
 
 
 def wm_geometry(*, hidden_size: int, intermediate_size: int, num_experts: int,
                 top_k: int, max_tokens: int) -> dict:
     """Static geometry shared by the kernel, the launcher and the CPU mirror tests."""
+    last = None
+    for fc2_rows, stages in RING_CHOICES:
+        try:
+            return _wm_geometry(hidden_size, intermediate_size, num_experts, top_k,
+                                max_tokens, fc2_rows, stages)
+        except _SmemOverflow as exc:
+            last = exc
+    raise ValueError(str(last))
+
+
+class _SmemOverflow(ValueError):
+    pass
+
+
+def _wm_geometry(hidden_size, intermediate_size, num_experts, top_k, max_tokens,
+                 fc2_rows, stages) -> dict:
     K, I, E = int(hidden_size), int(intermediate_size), int(num_experts)
-    if K % (64 * NUM_WARPS) or K % 128 or K % FC2_ROWS:
+    if K % (64 * NUM_WARPS) or K % 128 or K % fc2_rows:
         raise ValueError(f"wm decode needs hidden_size % {64 * NUM_WARPS} == 0, got {K}")
     if I % 64 or I % FC1_ROWS:
         raise ValueError(f"wm decode needs intermediate_size % 64 == 0, got {I}")
@@ -29,7 +49,8 @@ def wm_geometry(*, hidden_size: int, intermediate_size: int, num_experts: int,
         raise ValueError(f"wm decode needs num_experts % 32 == 0 and <= 1024, got {E}")
     if not 1 <= max_tokens <= 2 * PASS_ROWS:
         raise ValueError(f"wm decode supports 1..{2 * PASS_ROWS} tokens, got {max_tokens}")
-    g = dict(K=K, I=I, E=E, top_k=int(top_k), max_tokens=int(max_tokens))
+    g = dict(K=K, I=I, E=E, top_k=int(top_k), max_tokens=int(max_tokens),
+             fc2_rows=int(fc2_rows), stages=int(stages))
     g["passes"] = -(-max_tokens // PASS_ROWS)
     g["k2"] = K // 2                      # w13 row bytes
     g["i2"] = I // 2                      # down row bytes
@@ -39,17 +60,17 @@ def wm_geometry(*, hidden_size: int, intermediate_size: int, num_experts: int,
     g["ch_blocks"] = I // FC1_ROWS
     g["fc1_stages"] = g["ch_blocks"] * 2 * g["kchunks"]
     g["fc2_k64"] = I // 64
-    g["fc2_stages"] = K // FC2_ROWS
+    g["fc2_stages"] = K // fc2_rows
     g["spi"] = g["fc1_stages"] + g["fc2_stages"]  # stages per item
     # Shared row strides are padded by 16 B so the QMMA fragment loads of the eight
     # q rows of a warp land in distinct banks.
     g["p1"] = K // 2 + 16
     g["p2"] = g["i2"] + 16
     g["fc1_chunks"] = FC1_ROWS * (K // 2) // 16
-    g["fc2_chunks"] = FC2_ROWS * g["i2"] // 16
+    g["fc2_chunks"] = fc2_rows * g["i2"] // 16
     g["fc1_words"] = FC1_ROWS * g["fc1_k64"]
-    g["fc2_words"] = FC2_ROWS * g["fc2_k64"]
-    g["slot_payload"] = max(FC1_ROWS * g["p1"], FC2_ROWS * g["p2"])
+    g["fc2_words"] = fc2_rows * g["fc2_k64"]
+    g["slot_payload"] = max(FC1_ROWS * g["p1"], fc2_rows * g["p2"])
     g["slot_bytes"] = g["slot_payload"] + 4 * max(g["fc1_words"], g["fc2_words"])
     # F8_128x4 planes: a 128-row atom holds (cols/4) 512-byte K64 groups.
     g["sf13_atom"] = (K // 64) * 512
@@ -65,7 +86,7 @@ def wm_geometry(*, hidden_size: int, intermediate_size: int, num_experts: int,
     g["bitmap_words"] = E // 32
     off = 0
     for name, size in (
-        ("ring", STAGES * g["slot_bytes"]),
+        ("ring", stages * g["slot_bytes"]),
         ("a", PASS_ROWS * g["a_stride"]),
         ("as", PASS_ROWS * 4 * g["as_words"]),
         ("h", PASS_ROWS * I * 2),
@@ -87,7 +108,7 @@ def wm_geometry(*, hidden_size: int, intermediate_size: int, num_experts: int,
             g["hs_stride"] * PASS_ROWS > PASS_ROWS * 4 * g["as_words"]:
         raise ValueError("wm decode intermediate does not fit the aliased A region")
     if off > MAX_SMEM_BYTES:
-        raise ValueError(f"wm decode needs {off} B of shared memory (> {MAX_SMEM_BYTES})")
+        raise _SmemOverflow(f"wm decode needs {off} B of shared memory (> {MAX_SMEM_BYTES})")
     if g["fc1_chunks"] % THREADS or g["fc2_chunks"] > g["fc1_chunks"]:
         raise ValueError("wm decode stage copy geometry is unsupported")
     return g
@@ -101,7 +122,7 @@ def wm_stage_plan(g: dict, stage: int) -> tuple[str, int, int, int]:
         kc = stage % g["kchunks"]
         return "fc1", half * g["I"] + cb * FC1_ROWS, kc, cb
     rb = stage - g["fc1_stages"]
-    return "fc2", rb * FC2_ROWS, 0, rb
+    return "fc2", rb * g["fc2_rows"], 0, rb
 
 
 def wm_scale_offset(row, k64, *, atom_bytes: int):

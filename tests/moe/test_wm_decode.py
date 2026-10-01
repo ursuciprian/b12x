@@ -37,7 +37,9 @@ from b12x.preparation import PreparationSession, PreparedCall
 
 from ..conftest import require_b12x
 
-E, K, I, TOPK = 512, 2560, 320, 10
+# B12X_WM_TEST_INTERMEDIATE=640 runs the TP=1 (full intermediate) geometry.
+E, K, TOPK = 512, 2560, 10
+I = int(os.environ.get("B12X_WM_TEST_INTERMEDIATE", "320"))
 
 
 def _weights(device, *, seed, per_expert_scales):

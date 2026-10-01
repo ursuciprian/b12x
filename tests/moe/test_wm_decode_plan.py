@@ -23,6 +23,7 @@ from b12x.moe._shared.kernels.wm_geometry import (
 )
 
 QWEN = dict(hidden_size=2560, intermediate_size=320, num_experts=512, top_k=10)
+QWEN_TP1 = dict(QWEN, intermediate_size=640)
 
 
 def _plane_offsets(rows: int, cols: int) -> torch.Tensor:
@@ -89,9 +90,10 @@ def _mirror_stage_copies(g: dict, stage: int):
     return kind, payload, words
 
 
+@pytest.mark.parametrize("shape", [QWEN, QWEN_TP1], ids=["I320", "I640"])
 @pytest.mark.parametrize("max_tokens", [1, 5, 16, 20, 32])
-def test_item_stages_stream_every_expert_byte_once(max_tokens):
-    g = wm_geometry(**QWEN, max_tokens=max_tokens)
+def test_item_stages_stream_every_expert_byte_once(max_tokens, shape):
+    g = wm_geometry(**shape, max_tokens=max_tokens)
     K, I = g["K"], g["I"]
     counts = {
         "fc1": Counter(), "fc2": Counter(), "fc1_w": Counter(), "fc2_w": Counter(),
@@ -112,7 +114,7 @@ def test_item_stages_stream_every_expert_byte_once(max_tokens):
     for stage in range(g["fc1_stages"]):
         _, row0, _, cb = wm_stage_plan(g, stage)
         assert row0 % I == cb * FC1_ROWS
-    assert g["spi"] == g["fc1_stages"] + K // FC2_ROWS
+    assert g["spi"] == g["fc1_stages"] + K // g["fc2_rows"]
 
 
 def _mirror_items(ids: list[int], num_experts: int):
@@ -190,6 +192,11 @@ def test_geometry_fits_shared_memory_and_rejects_unsupported_shapes():
         g = wm_geometry(**QWEN, max_tokens=m)
         assert g["smem_bytes"] <= 101376
         assert g["passes"] == (1 if m <= 16 else 2)
+        # TP=2 keeps the original ring; TP=1 (I=640) falls back to 32-row FC2 stages.
+        assert (g["fc2_rows"], g["stages"]) == (FC2_ROWS, 5)
+        g1 = wm_geometry(**QWEN_TP1, max_tokens=m)
+        assert g1["smem_bytes"] <= 101376
+        assert (g1["fc2_rows"], g1["stages"]) == (32, 4)
     with pytest.raises(ValueError):
         wm_geometry(**QWEN, max_tokens=33)
     with pytest.raises(ValueError):

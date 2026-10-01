@@ -13,13 +13,13 @@ owns items ``b, b + grid, ...``. Every item streams the same bytes, which is its
 expert's full w13 and down weights exactly once, so a round of items finishes
 together.
 
-Each item is one uniform sequence of 11.25 KB weight stages through a
-``STAGES``-slot cp.async ring:
+Each item is one uniform sequence of ~11 KB weight stages through a
+``g["stages"]``-slot cp.async ring (5 at I=320, 4 at I=640):
 
 - FC1: for each 32-channel block, 32 up rows and then the same 32 gate rows. Each
   row group is swept over K in chunks of 640 (320 contiguous bytes per row) with the
   rows' K64 scale words gathered from the F8_128x4 plane.
-- FC2: blocks of 64 ``down`` rows over the full intermediate K, stored as fully
+- FC2: blocks of 64 (I=320) or 32 (I=640) ``down`` rows over the full intermediate K, stored as fully
   contiguous 10 KB spans plus 64 x (I/64) scale words.
 
 Weight addresses depend only on the expert id, so the ring runs straight through the
@@ -57,6 +57,7 @@ from cutlass.cutlass_dsl import Int32, Int64, T, Uint8, Uint32, Uint64, dsl_user
 from b12x._lib.intrinsics import (
     bfloat2_to_float2_scaled,
     cp_async4_shared_global,
+    cp_async_u32_shared_global,
     cp_async_u64_shared_global,
     fabs_f32,
     fmax_f32,
@@ -78,9 +79,7 @@ from b12x._lib.intrinsics import (
 from b12x.moe._shared.kernels.wm_geometry import (
     FC1_ROWS,
     NUM_WARPS,
-    FC2_ROWS,
     PASS_ROWS,
-    STAGES,
     THREADS,
     wm_geometry,
 )
@@ -157,8 +156,10 @@ class MoEWeightMajorDecodeKernel:
     @property
     def __cache_key__(self):
         g = self.g
-        return ("wm_decode", 1, g["K"], g["I"], g["E"], g["top_k"], g["max_tokens"],
-                STAGES, self.fast_math, self.ids_int64, tuple(sorted(self.probe)))
+        key = ("wm_decode", 1, g["K"], g["I"], g["E"], g["top_k"], g["max_tokens"],
+               g["stages"], self.fast_math, self.ids_int64, tuple(sorted(self.probe)))
+        # The default (64-row FC2) geometry keeps its original key.
+        return key if g["fc2_rows"] == 64 else key + (("fc2_rows", g["fc2_rows"]),)
 
     @cute.jit
     def __call__(
@@ -405,7 +406,7 @@ class MoEWeightMajorDecodeKernel:
                                                get_ptr_as_int64(sf13, e_base + Int64(off)))
         else:
             rb = stage - Int32(g["fc1_stages"])
-            row0 = rb * Int32(FC2_ROWS)
+            row0 = rb * Int32(g["fc2_rows"])
             per_row = g["i2"] // 16
             span = (Int64(expert) * Int64(K) + Int64(row0)) * Int64(g["i2"])
             for i in cutlass.range_constexpr(-(-g["fc2_chunks"] // THREADS)):
@@ -416,8 +417,20 @@ class MoEWeightMajorDecodeKernel:
                     cp_async4_shared_global(slot_base + r * Int32(g["p2"]) + v * Int32(16),
                                             get_ptr_as_int64(w2, span + Int64(idx * Int32(16))))
             e_base = Int64(expert) * Int64(g["sf2_expert"])
+            if cutlass.const_expr(g["fc2_rows"] == 32 and "noscale" not in self.probe):
+                # 32-row stages own one word of each F8_128x4 16 B chunk: 4 B per
+                # (row, K64); shared layout [K64][r 0..31].
+                for i in cutlass.range_constexpr(-(-g["fc2_words"] // THREADS)):
+                    idx = tid + Int32(i * THREADS)
+                    if idx < Int32(g["fc2_words"]):
+                        j = idx >> Int32(5)
+                        row = row0 + (idx & Int32(31))
+                        off = ((row >> Int32(7)) * Int32(g["sf2_atom"]) + j * Int32(512)
+                               + (row & Int32(31)) * Int32(16) + ((row & Int32(127)) >> Int32(5)) * Int32(4))
+                        cp_async_u32_shared_global(sf_base + idx * Int32(4),
+                                                   get_ptr_as_int64(sf2, e_base + Int64(off)))
             # 8 B per (row pair r, r + 32; K64); shared layout [K64][r 0..31][row, row + 32].
-            for i in cutlass.range_constexpr(0 if "noscale" in self.probe else -(-(g["fc2_words"] // 2) // THREADS)):
+            for i in cutlass.range_constexpr(0 if ("noscale" in self.probe or g["fc2_rows"] != 64) else -(-(g["fc2_words"] // 2) // THREADS)):
                 idx = tid + Int32(i * THREADS)
                 if idx < Int32(g["fc2_words"] // 2):
                     j = idx >> Int32(5)
@@ -535,7 +548,8 @@ class MoEWeightMajorDecodeKernel:
         iss_e = Int32(0)
         if mine > Int32(0):
             iss_e = self._item_expert(base, bid, d)
-        for s0 in cutlass.range_constexpr(STAGES - 1):
+        stages = g["stages"]
+        for s0 in cutlass.range_constexpr(stages - 1):
             if Int32(s0) < total:
                 self._issue_stage(w13, sf13, w2, sf2, base, tid, iss_e, Int32(s0), Int32(s0))
             cute.arch.cp_async_commit_group()
@@ -563,20 +577,20 @@ class MoEWeightMajorDecodeKernel:
                     n_rows = Int32(ld_shared_u32(base + Int32(g["off_nrows"])))
                     self._quantize_rows(x, in_gs, base, tid, cur_e, n_rows)
 
-            # Prefetch stage step + STAGES - 1 into the slot freed last iteration.
-            nxt = step + Int32(STAGES - 1)
+            # Prefetch stage step + stages - 1 into the slot freed last iteration.
+            nxt = step + Int32(stages - 1)
             if nxt < total:
                 nj = nxt // spi
                 ns = nxt - nj * spi
                 if ns == Int32(0):
                     iss_e = self._item_expert(base, bid + nj * grid, d)
-                self._issue_stage(w13, sf13, w2, sf2, base, tid, iss_e, ns, nxt % Int32(STAGES))
+                self._issue_stage(w13, sf13, w2, sf2, base, tid, iss_e, ns, nxt % Int32(stages))
             cute.arch.cp_async_commit_group()
-            cute.arch.cp_async_wait_group(STAGES - 1)
+            cute.arch.cp_async_wait_group(stages - 1)
             cute.arch.fence_proxy("async.shared", space="cta")
             cute.arch.sync_threads()
 
-            slot_base = base + Int32(g["off_ring"]) + (step % Int32(STAGES)) * Int32(g["slot_bytes"])
+            slot_base = base + Int32(g["off_ring"]) + (step % Int32(stages)) * Int32(g["slot_bytes"])
             sf_base = slot_base + Int32(g["slot_payload"])
             if cutlass.const_expr("nocompute" not in self.probe):
                 if s < Int32(g["fc1_stages"]):
@@ -644,8 +658,9 @@ class MoEWeightMajorDecodeKernel:
                     hs_base = as_base
                     sf_row = q + Int32(8) * (c & Int32(1))
                     dal = dalpha[cur_e].to(cutlass.Float32)
-                    for t in cutlass.range_constexpr(2):
-                        nt = warp * Int32(2) + Int32(t)
+                    tiles = g["fc2_rows"] // (8 * NUM_WARPS)
+                    for t in cutlass.range_constexpr(tiles):
+                        nt = warp * Int32(tiles) + Int32(t)
                         b_row = nt * Int32(8) + q
                         acc = cute.make_rmem_tensor((4,), cutlass.Float32)
                         acc.fill(0.0)
@@ -659,15 +674,18 @@ class MoEWeightMajorDecodeKernel:
                             b_off = slot_base + b_row * Int32(g["p2"]) + Int32(jj * 32) + Int32(4) * c
                             b0 = ld_shared_u32(b_off)
                             b1 = ld_shared_u32(b_off + Int32(16))
-                            sfb = ld_shared_u32(sf_base + ((Int32(jj * 32) + (b_row & Int32(31))) * Int32(2)
-                                                           + (b_row >> Int32(5))) * Int32(4))
+                            if cutlass.const_expr(g["fc2_rows"] == 64):
+                                sfb = ld_shared_u32(sf_base + ((Int32(jj * 32) + (b_row & Int32(31))) * Int32(2)
+                                                               + (b_row >> Int32(5))) * Int32(4))
+                            else:
+                                sfb = ld_shared_u32(sf_base + (Int32(jj * 32) + b_row) * Int32(4))
                             d0, d1, d2_, d3 = nvfp4_mma_m16n8k64_f32_e2m1(
                                 acc[0], acc[1], acc[2], acc[3], a0, a1, a2, a3, b0, b1, sfa, sfb)
                             acc[0] = d0
                             acc[1] = d1
                             acc[2] = d2_
                             acc[3] = d3
-                        col = rb * Int32(FC2_ROWS) + nt * Int32(8) + Int32(2) * c
+                        col = rb * Int32(g["fc2_rows"]) + nt * Int32(8) + Int32(2) * c
                         for hr in cutlass.range_constexpr(2):
                             row = q + Int32(8 * hr)
                             if row < n_rows:

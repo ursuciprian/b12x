@@ -31,6 +31,12 @@ EXPERT_BYTES = 2 * I * K // 2 + 2 * I * K // 16 + K * I // 2 + K * I // 16  # 1,
 MIN_ROTATION_BYTES = 512 << 20
 
 
+def set_intermediate(width):
+    global I, EXPERT_BYTES
+    I = width
+    EXPERT_BYTES = 2 * I * K // 2 + 2 * I * K // 16 + K * I // 2 + K * I // 16
+
+
 def _experts(device):
     gen = torch.Generator(device=device).manual_seed(1)
     w1 = torch.randint(0, 256, (E, 2 * I, K // 2), dtype=torch.uint8, device=device, generator=gen)
@@ -57,7 +63,7 @@ def _experts(device):
 
 
 def _plan(experts, m, backend, shared_input):
-    if backend == "wm":
+    if backend in ("wm", "flint"):
         os.environ["B12X_MOE_DECODE_BACKEND"] = "wm"
         override = None
     else:
@@ -87,23 +93,43 @@ def _route_sets(device, m, d):
     return sets
 
 
-def bench(device, experts, backend, m, d, *, replays, shared_input):
+def _route_sets_skewed(device, m, window, skew, seed=0):
+    """Real-routing stand-in: each call's tokens draw TOPK distinct experts from a window of
+    ``window`` experts with Zipf(skew) popularity (shuffled per call), so per-expert row
+    counts are uneven and D varies per call. Windows advance by ``window`` experts."""
+    gen = torch.Generator().manual_seed(seed)
+    calls = -(-E // window) + 1
+    probs = 1.0 / torch.arange(1, window + 1, dtype=torch.float64) ** skew
+    sets = []
+    for i in range(calls):
+        perm = torch.randperm(window, generator=gen)
+        idx = torch.multinomial(probs.expand(m, window), TOPK, replacement=False, generator=gen)
+        sets.append(((perm[idx] + i * window) % E).to(torch.int32).to(device).contiguous())
+    return sets
+
+
+def bench(device, experts, backend, m, d, *, replays, shared_input, skew=0.0):
     # "wm:nocompute+noscale" times a probe variant of wm (wrong results, timing only).
+    # "flint" is the wm backend with B12X_MOE_WM_SCHEDULE=flint, held for plan, bind and run.
     backend, _, probe = backend.partition(":")
     os.environ["B12X_WM_TIMING_PROBE"] = probe.replace("+", ",")
+    if backend == "flint":
+        os.environ["B12X_MOE_WM_SCHEDULE"] = "flint"
     try:
         return _bench(device, experts, backend, m, d, replays=replays, shared_input=shared_input,
-                      label=backend + (":" + probe if probe else ""))
+                      skew=skew, label=backend + (":" + probe if probe else ""))
     finally:
         os.environ.pop("B12X_WM_TIMING_PROBE", None)
+        os.environ.pop("B12X_MOE_WM_SCHEDULE", None)
 
 
-def _bench(device, experts, backend, m, d, *, replays, shared_input, label):
+def _bench(device, experts, backend, m, d, *, replays, shared_input, skew, label):
     plan = _plan(experts, m, backend, shared_input)
     a = (torch.randn(m, K, device=device) * 0.35).to(torch.bfloat16)
     weights = torch.full((m, TOPK), 1.0 / TOPK, device=device)
-    sets = _route_sets(device, m, d)
-    rotation = len(sets) * d * EXPERT_BYTES
+    sets = _route_sets_skewed(device, m, d, skew) if skew else _route_sets(device, m, d)
+    d = sum(s.unique().numel() for s in sets) / len(sets)  # mean distinct experts per call
+    rotation = int(len(sets) * d * EXPERT_BYTES)
     if rotation < MIN_ROTATION_BYTES:
         raise RuntimeError(f"weight rotation {rotation >> 20} MB < 512 MB: L2 would fake bandwidth")
     scratch = tuple(torch.empty(s.shape, dtype=s.dtype, device=device) for s in plan.scratch_specs())
@@ -140,7 +166,7 @@ def _bench(device, experts, backend, m, d, *, replays, shared_input, label):
         graph.reset()
     samples.sort()
     t = samples[len(samples) // 2]
-    return dict(backend=label, m=m, d=d, us=t, us_min=samples[0],
+    return dict(backend=label, m=m, d=round(d), us=t, us_min=samples[0],
                 gbps=d * EXPERT_BYTES / (t * 1e3), rotation_mb=rotation >> 20)
 
 
@@ -151,16 +177,20 @@ def main():
                         help="comma list of M:D (tokens:distinct experts)")
     parser.add_argument("--replays", type=int, default=30)
     parser.add_argument("--no-shared-input", action="store_true")
+    parser.add_argument("--intermediate", type=int, default=320, help="320 = TP2 rank, 640 = TP1")
+    parser.add_argument("--skew", type=float, default=0.0,
+                        help="Zipf exponent of skewed routing; D in --shapes is then the window")
     args = parser.parse_args()
+    set_intermediate(args.intermediate)
     device = torch.device("cuda")
     experts = _experts(device)
-    print(f"bank {E} experts x {EXPERT_BYTES} B = {E * EXPERT_BYTES / 1e6:.1f} MB")
+    print(f"bank {E} experts x {EXPERT_BYTES} B = {E * EXPERT_BYTES / 1e6:.1f} MB (I={I}, skew={args.skew})")
     print(f"{'backend':26} {'M':>3} {'D':>4} {'us/call':>9} {'min':>9} {'GB/s':>7} {'rot MB':>7}")
     for shape in args.shapes.split(","):
         m, d = (int(v) for v in shape.split(":"))
         for backend in args.backends.split(","):
             r = bench(device, experts, backend, m, d, replays=args.replays,
-                      shared_input=not args.no_shared_input)
+                      shared_input=not args.no_shared_input, skew=args.skew)
             print(f"{r['backend']:26} {r['m']:>3} {r['d']:>4} {r['us']:>9.1f} {r['us_min']:>9.1f} "
                   f"{r['gbps']:>7.1f} {r['rotation_mb']:>7}", flush=True)
 

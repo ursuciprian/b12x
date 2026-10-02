@@ -128,3 +128,22 @@ def wm_stage_plan(g: dict, stage: int) -> tuple[str, int, int, int]:
 def wm_scale_offset(row, k64, *, atom_bytes: int):
     """Byte offset of the 4-scale K64 word of ``row`` in one expert's F8_128x4 plane."""
     return (row >> 7) * atom_bytes + k64 * 512 + (row & 31) * 16 + ((row & 127) >> 5) * 4
+
+
+def flint_geometry(g: dict) -> dict:
+    """``wm`` geometry plus flint's shared route-position table."""
+    g = dict(g)
+    g["off_route"] = g["smem_bytes"]
+    g["smem_bytes"] += 4 * PASS_ROWS
+    if g["smem_bytes"] > MAX_SMEM_BYTES:
+        raise ValueError(f"flint decode needs {g['smem_bytes']} B of shared memory")
+    g["fc1_units"] = g["I"] // FC1_ROWS
+    g["fc2_units"] = g["fc2_stages"]
+    g["h_vec"] = PASS_ROWS * g["I"] * 2 // 16  # 16 B vectors per item h tile
+    return g
+
+
+def flint_ranges(items: int, units_per_item: int, grid: int, bid: int) -> tuple[int, int]:
+    """CTA ``bid``'s contiguous unit range; the CPU mirror of the kernel split."""
+    total = items * units_per_item
+    return bid * total // grid, (bid + 1) * total // grid

@@ -12181,6 +12181,16 @@ register_program_cache(_WM_KERNEL_CACHE)
 _MOE_DECODE_BACKEND_ENV = "B12X_MOE_DECODE_BACKEND"
 _MOE_WM_MAX_TOKENS_ENV = "B12X_MOE_WM_MAX_TOKENS"
 _MOE_WM_MIN_TOKENS_ENV = "B12X_MOE_WM_MIN_TOKENS"
+# B12X_MOE_WM_SCHEDULE=flint swaps the wm per-expert schedule for flint's byte-balanced
+# two-phase schedule (kernels/flint_decode.py). Unset keeps wm, with unchanged keys.
+_MOE_WM_SCHEDULE_ENV = "B12X_MOE_WM_SCHEDULE"
+
+
+def _wm_schedule() -> str:
+    schedule = os.environ.get(_MOE_WM_SCHEDULE_ENV, "").strip().lower() or "item"
+    if schedule not in ("item", "flint"):
+        raise ValueError(f"{_MOE_WM_SCHEDULE_ENV} must be 'item' or 'flint', got {schedule!r}")
+    return schedule
 
 
 def _wm_decode_controls() -> dict:
@@ -12206,6 +12216,8 @@ def _wm_decode_controls() -> dict:
         if not 1 <= min_tokens <= max_tokens:
             raise ValueError(f"{_MOE_WM_MIN_TOKENS_ENV} must be within 1..{max_tokens}, got {min_tokens}")
         controls["wm_min_tokens"] = min_tokens
+    if _wm_schedule() != "item":
+        controls["wm_schedule"] = _wm_schedule()
     return controls
 
 
@@ -12231,9 +12243,11 @@ def _get_wm_kernel(
     topk_ids_dtype: torch.dtype,
     fast_math: bool,
 ):
+    from b12x.moe._shared.kernels.flint_decode import MoEFlintDecodeKernel
     from b12x.moe._shared.kernels.wm_decode import MoEWeightMajorDecodeKernel
 
-    kernel = MoEWeightMajorDecodeKernel(
+    flint = _wm_schedule() == "flint"
+    kernel = (MoEFlintDecodeKernel if flint else MoEWeightMajorDecodeKernel)(
         hidden_size=k,
         intermediate_size=n,
         num_experts=weight_E,
@@ -12268,10 +12282,12 @@ def _get_wm_kernel(
         dummy(cutlass.Float32, 4),  # FC2 input scale
         dummy(cutlass.Float32, 4),  # FC2 alpha
         dummy(cutlass.BFloat16),  # output
+        *((dummy(cutlass.Uint8), dummy(cutlass.Int32, 4), dummy(cutlass.Int32, 4)) if flint else ()),
         Int32(max_tokens),
         Int32(1),
         current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key("integration.tp_moe.wm_decode", 1, cache_key),
+        compile_spec=KernelCompileSpec.from_key(
+            "integration.tp_moe.flint_decode" if flint else "integration.tp_moe.wm_decode", 1, cache_key),
     )
     if not planning():
         _WM_KERNEL_CACHE[cache_key] = compiled
@@ -12293,8 +12309,9 @@ def _launch_wm(
     num_topk: int,
     max_tokens: int,
     fast_math: bool,
+    workspace=None,
 ) -> None:
-    """Zero the output in-stream, then run the weight-major decode kernel."""
+    """Zero the output in-stream, then run the weight-major (or flint) decode kernel."""
     m = a.shape[0]
     if m > max_tokens:
         raise ValueError(f"wm decode launch has {m} tokens > planned {max_tokens}")
@@ -12325,6 +12342,14 @@ def _launch_wm(
     def ptr(dt, t, align=16):
         return make_ptr(dt, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=align)
 
+    flint_args = ()
+    if _wm_schedule() == "flint":
+        # flint scratch from the shadow dynamic workspace (see flint_decode.py).
+        h = workspace.packed_input
+        if h.numel() < max_tokens * num_topk * n * 2:
+            raise ValueError("flint decode: packed_input is too small for the h rows")
+        flint_args = (ptr(cutlass.Uint8, h), ptr(cutlass.Int32, workspace.barrier_count, 4),
+                      ptr(cutlass.Int32, workspace.barrier_epoch, 4))
     scatter_output.zero_()
     if m == 0:
         return
@@ -12342,6 +12367,7 @@ def _launch_wm(
         ptr(cutlass.Float32, down_input_scale, 4),
         ptr(cutlass.Float32, weights.w2_alpha, 4),
         ptr(cutlass.BFloat16, scatter_output),
+        *flint_args,
         Int32(m),
         Int32(_wm_grid(a.device)),
         current_cuda_stream(),
@@ -13320,6 +13346,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             num_topk=num_topk,
             max_tokens=plan.routed_rows // num_topk,
             fast_math=fast_math,
+            workspace=s,
         )
         return scatter_output
     if impl == "dynamic":

@@ -87,11 +87,13 @@ split. Every call is cut into equal byte ranges over all CTAs, whatever D is:
    unit ends with SiLU(alpha g) x (alpha u), rounded to BF16 and stored to a global h
    row per route (`hbuf[route][I]`).
 3. **Grid barrier.** It is sense-reversing, uses slot 0 of the workspace's
-   `barrier_count` / `barrier_epoch`, and leaves the counter at zero on a successful
-   release. All CTAs must be resident: grid = `_flint_grid()`'s occupancy-derived,
-   SM-capped CTA count, never `_wm_grid()`'s `B12X_MOE_WM_GRID`-capped value (see
-   "Plan and cache-key integration" below). Weight addresses depend only on routing,
-   so the cp.async ring has already issued the first FC2 stages before a CTA waits.
+   `barrier_count` / `barrier_epoch`, and leaves the counter at zero after a completed
+   launch. The kernel is launched cooperatively (`cooperative=True`), so the driver
+   either makes every CTA co-resident or fails the launch with
+   `CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_LARGE`, which the call raises. The grid is
+   `_wm_grid()`: every SM at 1 CTA/SM, or fewer under `B12X_MOE_WM_GRID` (a smaller grid
+   only makes co-residency easier). Weight addresses depend only on routing, so the
+   cp.async ring has already issued the first FC2 stages before a CTA waits.
 4. **Phase B (FC2).** The unit is (item, 32 down rows) over full I, one `wm` FC2 stage of
    10 KB contiguous plus scales. The `items x 80` units are cut the same way. When the
    item changes, the CTA loads that item's h rows from L2 (`ld.global.cg`), requantizes
@@ -118,7 +120,11 @@ combine noise (`tests/moe/test_wm_decode.py`).
   `dynamic` and against the FP32-accumulating NVFP4 oracle (`moe_reference_nvfp4`). It
   covers capacities 5/20/32, the spread/clustered/hot (two-pass)/disjoint routing
   patterns, w31 storage, and graph replay with live route changes and no replay
-  allocation, at I=640 and I=320.
+  allocation, at I=640 and I=320. Scratch is filled with 0xFF (BF16 NaN) before every
+  flint call, so an h read without a same-launch write shows up as NaN. flint-specific
+  tests add a direct flint-vs-wm check (same inputs; bounded by wm's own BF16 combine
+  noise), 60 replays of one captured graph, a standalone `TPMoEWorkspacePool`, and
+  dynamic/flint interleaved on one scratch.
 - `tests/moe/test_flint_geometry.py` (CPU) checks shared memory, scratch fit, that the
   ranges tile the work with at most one unit of imbalance, and the selection controls.
 
@@ -127,32 +133,24 @@ combine noise (`tests/moe/test_wm_decode.py`).
 - Selection: `B12X_MOE_DECODE_BACKEND=wm` plus `B12X_MOE_WM_SCHEDULE=flint`. The
   schedule joins the wm query controls (`wm_schedule`) only when set, so the default
   and plain-wm keys stay byte-identical. The kernel cache key is
-  `("flint_decode", 1, ...)`, compiled under `integration.tp_moe.flint_decode` and
-  precompiled by the same preparation path as `wm`.
-- Scratch: no new allocation. h uses a shadow dynamic workspace's `packed_input`
+  `("flint_decode", 2, ...)` (2: cooperative launch), compiled under
+  `integration.tp_moe.flint_decode` and precompiled by the same preparation path as `wm`.
+- Scratch: no new allocation. h uses the shadow dynamic workspace's `packed_input`
   (rows_padded x K/2 bytes, which holds routes x I x 2 whenever 2I <= K/2). The barrier
-  uses `barrier_count` / `barrier_epoch`. `_workspace_pool_key` gives a flint-scheduled
-  plan its own pool entry (distinct from plain `dynamic` and from wm's item schedule at
-  the same shape), so this aliasing is scoped to other flint launches of the identical
-  shape only -- never a concurrently- or sequentially-interleaved `dynamic`/item-wm call
-  on "the same workspace" (B3). `_launch_wm` resets `barrier_count`/`barrier_epoch`
-  before every eager launch when the workspace is marked `volatile_launch_state`,
-  mirroring the dynamic/micro launchers, so an aborted prior flint launch cannot
-  silently corrupt the next one (B2).
-- Grid: `_flint_grid()` (not `_wm_grid()`) sizes the launch from the compiled kernel's
-  own occupancy (`cuOccupancyMaxActiveBlocksPerMultiprocessor`), capped at the SM count,
-  and refuses to launch (raises) if occupancy can't be established or if
-  `B12X_MOE_WM_GRID` is set -- that knob's "free SMs for a side-stream kernel" use case
-  is unsafe for flint's full-grid barrier (B1).
+  uses `barrier_count` / `barrier_epoch`. These are the same bytes `dynamic`'s grid
+  barrier uses when the two share a workspace (caller-owned scratch, or a pool's shared
+  arena). This is safe for the same reasons it is safe for `dynamic`: launches on one
+  workspace are stream-ordered, and on the binding path (`volatile_launch_state`)
+  `_launch_wm` re-zeros barrier slot 0 before every call, so an aborted earlier launch
+  cannot leave it dirty. Under capture those memsets are graph nodes. Overlapping lanes
+  on different streams must use distinct workspace pools, as for every b12x MoE backend.
 - vLLM: `B12X_MOE_WM_SCHEDULE` is declared in `vllm/envs.py` (`exp/r9-flint` off
   `exp/b14`) via `env_with_choices`, alongside `B12X_MOE_DECODE_BACKEND`, so the torch
   AOT compile key changes with it (see the plan-population gotcha).
 - Known limit: the launcher reads the schedule from the environment at launch, as
-  `B12X_MOE_WM_GRID` does. One process must not mix wm and flint plans without going
-  through `B12X_MOE_WM_SCHEDULE` (the pool-key split above makes this safe for
-  workspace aliasing, but the env var is still read at launch time, not plan-build
-  time). Moving the schedule into the plan's decode config needs a config-schema bump
-  and is left for promotion.
+  `B12X_MOE_WM_GRID` does. One process must not mix wm and flint plans. Moving the
+  schedule into the plan's decode config needs a config-schema bump and is left for
+  promotion.
 
 ## Expected result
 

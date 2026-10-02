@@ -133,8 +133,17 @@ def _prepare(device, plans, a, ids, weights):
     return session
 
 
-def _run(plan, device, a, ids, weights, rows):
+def _poison(tensors):
+    """Fill with 0xFF bytes (BF16 NaN): a flint h read that no write of the same launch
+    preceded turns the output NaN. Bind maps views only and run re-zeros the barrier."""
+    for t in tensors:
+        t.view(-1).view(torch.uint8).fill_(0xFF)
+
+
+def _run(plan, device, a, ids, weights, rows, poison=False):
     scratch = tuple(torch.empty(s.shape, dtype=s.dtype, device=device) for s in plan.scratch_specs())
+    if poison:
+        _poison(scratch)
     out = torch.full((rows, K), float("nan"), dtype=torch.bfloat16, device=device)
     binding = fused_moe.bind(plan, a=a[:rows], topk_ids=ids[:rows], topk_weights=weights[:rows],
                              scratch=scratch, output=out, input_scales_static=True)
@@ -163,7 +172,7 @@ def test_wm_matches_dynamic(capacity, per_expert_scales, monkeypatch):
         for pattern in ("spread", "clustered", "hot", "disjoint"):
             ids, weights = _routes(device, capacity, pattern, seed=17 * capacity + len(pattern))
             for rows in sorted({1, 2, 3, capacity // 2, capacity - 1, capacity} - {0}):
-                out_w, _, _ = _run(wm, device, a, ids, weights, rows)
+                out_w, _, _ = _run(wm, device, a, ids, weights, rows, poison=True)
                 out_d, _, _ = _run(dyn, device, a, ids, weights, rows)
                 out_d2, _, _ = _run(dyn, device, a, ids, weights, rows)
                 assert out_w.isfinite().all(), (pattern, rows)
@@ -203,7 +212,7 @@ def test_wm_w31_layout_matches_dynamic(monkeypatch):
     wm = _plan(experts, capacity, "wm", monkeypatch)
     session = _prepare(device, (dyn, wm), a, ids, weights)
     try:
-        out_w, _, _ = _run(wm, device, a, ids, weights, capacity)
+        out_w, _, _ = _run(wm, device, a, ids, weights, capacity, poison=True)
         out_d, _, _ = _run(dyn, device, a, ids, weights, capacity)
         assert _rms(out_w.float() - out_d.float()) <= 8e-3 * _rms(out_d)
     finally:
@@ -221,7 +230,7 @@ def test_wm_graph_replay_tracks_live_routes(monkeypatch):
     session = _prepare(device, (wm,), a, ids, weights)
     try:
         for rows in (1, 7, capacity):
-            out, binding, _ = _run(wm, device, a, ids, weights, rows)
+            out, binding, _ = _run(wm, device, a, ids, weights, rows, poison=True)
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
                 fused_moe.run(binding=binding)
@@ -232,6 +241,7 @@ def test_wm_graph_replay_tracks_live_routes(monkeypatch):
                 weights.copy_(new_w)
                 a.neg_()
                 out.fill_(float("nan"))
+                _poison((binding.packed_input,))  # flint's h rows
                 allocated = torch.cuda.memory_stats(device)["allocation.all.allocated"]
                 graph.replay()
                 torch.cuda.synchronize(device)
@@ -329,6 +339,8 @@ def test_flint_dynamic_interleave_shared_workspace(monkeypatch):
             ids, weights = _routes(device, capacity, pattern, seed=200 + round_idx)
             order = (dyn, flint) if round_idx % 2 == 0 else (flint, dyn)
             for plan in order:
+                if plan is flint:
+                    _poison(shared_scratch)
                 out = run_on_shared(plan, ids, weights)
                 ref = moe_reference_nvfp4(
                     a, w["w1"], w["w1_scale"], w["w1_alpha"], w["w2"], w["w2_scale"],
@@ -359,7 +371,7 @@ def test_flint_barrier_reuse_repeated_eager_calls(monkeypatch):
         patterns = ("spread", "clustered", "hot", "disjoint")
         for i in range(100):
             ids, weights = _routes(device, capacity, patterns[i % len(patterns)], seed=1000 + i)
-            out, _, _ = _run(flint, device, a, ids, weights, capacity)
+            out, _, _ = _run(flint, device, a, ids, weights, capacity, poison=True)
             assert out.isfinite().all(), i
             ref = moe_reference_nvfp4(
                 a, w["w1"], w["w1_scale"], w["w1_alpha"], w["w2"], w["w2_scale"],
@@ -403,7 +415,7 @@ def test_flint_distinct_expert_extremes(capacity, minimal, label, monkeypatch):
     flint = _plan(experts, capacity, "wm", monkeypatch)
     session = _prepare(device, (flint,), a, ids, weights)
     try:
-        out, _, _ = _run(flint, device, a, ids, weights, capacity)
+        out, _, _ = _run(flint, device, a, ids, weights, capacity, poison=True)
         assert out.isfinite().all(), label
         ref = moe_reference_nvfp4(
             a, w["w1"], w["w1_scale"], w["w1_alpha"], w["w2"], w["w2_scale"],
@@ -414,3 +426,126 @@ def test_flint_distinct_expert_extremes(capacity, minimal, label, monkeypatch):
         assert compare_to_reference(out.float(), ref).cos >= 0.9999 and err <= 0.015, (label, d, err)
     finally:
         session.__exit__(None, None, None)
+
+
+def _oracle(w, a, ids, weights):
+    return moe_reference_nvfp4(
+        a, w["w1"], w["w1_scale"], w["w1_alpha"], w["w2"], w["w2_scale"],
+        w["w2_alpha"], w["a1"], w["a2"], ids, weights, E, K, I,
+        quant_scale_math="dynamic_fast",
+    ).float()
+
+
+def test_flint_matches_wm_tightly(monkeypatch):
+    """flint vs wm (item schedule) on identical inputs.
+
+    Tolerance. flint reuses wm's quantizers, QMMA, split-K order, SiLU, BF16 h rounding
+    and FC2 epilogue, and both add one BF16 partial per (route, element), 10 adds per
+    output element. The only difference is the order of those 10 BF16 atomics, so
+    flint vs wm has the distribution of wm vs wm: two independent BF16 combine orders,
+    about sqrt(2) x 3.2e-3 = 4.5e-3 relative RMS (module docstring). The checks
+    require the global RMS difference under max(1.25 x wm's own run-to-run difference,
+    6e-3) and every row under 1e-2. One stale 16 B h vector per route-item (about 3%
+    on the affected rows) fails the row check; an unwritten h read is NaN (poison)."""
+    device = require_b12x()
+    w = _weights(device, seed=75, per_expert_scales=True)
+    experts = _experts(w, "w13")
+    capacity = 20
+    a = (torch.randn(capacity, K, device=device) * 0.35).to(torch.bfloat16)
+    ids0, weights0 = _routes(device, capacity, "spread", seed=7)
+    cases = [(pattern, rows) for pattern in ("spread", "clustered", "hot", "disjoint")
+             for rows in (1, capacity)]
+    outs = {}
+    for schedule in ("item", "flint"):
+        monkeypatch.setenv("B12X_MOE_WM_SCHEDULE", schedule)
+        plan = _plan(experts, capacity, "wm", monkeypatch)
+        session = _prepare(device, (plan,), a, ids0, weights0)
+        try:
+            for pattern, rows in cases:
+                ids, weights = _routes(device, capacity, pattern, seed=300 + len(pattern))
+                outs[schedule, pattern, rows] = [
+                    _run(plan, device, a, ids, weights, rows, poison=True)[0].float()
+                    for _ in range(2 if schedule == "item" else 1)
+                ]
+        finally:
+            session.__exit__(None, None, None)
+    for pattern, rows in cases:
+        wm1, wm2 = outs["item", pattern, rows]
+        (fl,) = outs["flint", pattern, rows]
+        assert fl.isfinite().all(), (pattern, rows)
+        scale = max(_rms(wm1), 1e-6)
+        diff = _rms(fl - wm1) / scale
+        noise = _rms(wm2 - wm1) / scale
+        row = ((fl - wm1).square().mean(1).sqrt() / wm1.square().mean(1).sqrt().clamp_min(1e-6)).max().item()
+        ctx = (pattern, rows, diff, noise, row)
+        assert diff <= max(1.25 * noise, 6e-3), ctx
+        assert row <= 1e-2, ctx
+
+
+def test_flint_single_graph_many_replays(monkeypatch):
+    """One captured flint graph, 60 replays with live routes and activations and h
+    poisoned before each: the captured barrier reset and the h relay hold every time."""
+    device = require_b12x()
+    monkeypatch.setenv("B12X_MOE_WM_SCHEDULE", "flint")
+    w = _weights(device, seed=76, per_expert_scales=False)
+    experts = _experts(w, "w13")
+    capacity = 20
+    a = (torch.randn(capacity, K, device=device) * 0.35).to(torch.bfloat16)
+    ids, weights = _routes(device, capacity, "spread", seed=8)
+    flint = _plan(experts, capacity, "wm", monkeypatch)
+    session = _prepare(device, (flint,), a, ids, weights)
+    try:
+        out, binding, _ = _run(flint, device, a, ids, weights, capacity, poison=True)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            fused_moe.run(binding=binding)
+        patterns = ("hot", "spread", "clustered", "disjoint")
+        for step in range(60):
+            new_ids, new_w = _routes(device, capacity, patterns[step % len(patterns)], seed=500 + step)
+            ids.copy_(new_ids)
+            weights.copy_(new_w)
+            a.neg_()
+            out.fill_(float("nan"))
+            _poison((binding.packed_input,))
+            graph.replay()
+            torch.cuda.synchronize(device)
+            assert out.isfinite().all(), step
+            ref = _oracle(w, a, ids, weights)
+            err = _rms(out.float() - ref) / _rms(ref)
+            assert compare_to_reference(out.float(), ref).cos >= 0.9999 and err <= 0.015, (step, err)
+        graph.reset()
+    finally:
+        session.__exit__(None, None, None)
+
+
+def test_flint_standalone_pool_repeated_calls(monkeypatch):
+    """flint through a standalone TPMoEWorkspacePool (no shared arena), the sglang
+    path: the pool allocates and resolves one workspace under the runtime key, and 100
+    calls on it stay correct with h poisoned before each. (The run path rebuilds the
+    workspace with volatile_launch_state=True, so the barrier is still re-zeroed.)"""
+    import b12x.moe.fused_moe._impl as tp_moe
+
+    device = require_b12x()
+    monkeypatch.setenv("B12X_MOE_WM_SCHEDULE", "flint")
+    w = _weights(device, seed=77, per_expert_scales=False)
+    experts = _experts(w, "w13")
+    capacity = 20
+    a = (torch.randn(capacity, K, device=device) * 0.35).to(torch.bfloat16)
+    config = fused_moe.MoeDecodeConfig(backend="wm", route_planner="internal", max_active_clusters=None)
+    pool = tp_moe.TPMoEWorkspacePool()
+    out = torch.empty(capacity, K, dtype=torch.bfloat16, device=device)
+    patterns = ("spread", "clustered", "hot", "disjoint")
+    for i in range(100):
+        ids, weights = _routes(device, capacity, patterns[i % len(patterns)], seed=2000 + i)
+        binding = pool.bind_fp4(a=a, experts=experts._impl, topk_weights=weights, topk_ids=ids,
+                                output=out, input_scales_static=True, fast_math=True,
+                                decode_config=config)
+        _poison((binding.packed_input,))
+        out.fill_(float("nan"))
+        binding.run()
+        torch.cuda.synchronize(device)
+        assert out.isfinite().all(), i
+        ref = _oracle(w, a, ids, weights)
+        err = _rms(out.float() - ref) / _rms(ref)
+        assert compare_to_reference(out.float(), ref).cos >= 0.9999 and err <= 0.015, (i, err)
+    assert len(pool.workspaces) == 1, list(pool.workspaces)

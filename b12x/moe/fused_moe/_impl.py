@@ -7299,7 +7299,6 @@ def _workspace_pool_key(
     num_topk: int,
     device: torch.device,
     dtype: torch.dtype,
-    flint: bool = False,
 ) -> tuple:
     # Pool-backed workspaces are capacity-based. Avoid
     # exact-shape keys here or long-tail prompt lengths will accumulate one
@@ -7319,14 +7318,6 @@ def _workspace_pool_key(
         num_topk,
         device.index or 0,
         dtype,
-        # B3: a flint-scheduled "dynamic" plan gets its own pool entry so its
-        # packed_input/barrier_count/barrier_epoch are never the same tensors
-        # a plain dynamic (or wm item-schedule) plan of identical shape would
-        # resolve to -- e.g. the M>32 fallback, which otherwise shares this
-        # exact key (same implementation, quant_mode, shape; max_rows and
-        # state_E are already collapsed to -1 above). See flint_decode.py's
-        # module docstring and docs/flint.md.
-        bool(flint),
     )
 
 
@@ -7596,11 +7587,6 @@ def _resolve_workspace(
         dtype=plan.dtype,
         quant_mode=plan.quant_mode,
         activation=plan.activation,
-        flint=(
-            plan.implementation == "dynamic"
-            and plan.decode_config.backend == "wm"
-            and _wm_schedule() == "flint"
-        ),
     )
     resolved = workspace.workspaces.get(key)
     if resolved is None and torch.cuda.is_current_stream_capturing():
@@ -12357,34 +12343,19 @@ def _launch_wm(
         return make_ptr(dt, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=align)
 
     flint_args = ()
-    grid_x = _wm_grid(a.device)
     if _wm_schedule() == "flint":
-        # flint scratch is this (now flint-dedicated, see _workspace_pool_key's
-        # flint flag) workspace's packed_input/barrier_count/barrier_epoch --
-        # see flint_decode.py's module docstring for the exclusivity contract.
+        # flint scratch from the shadow dynamic workspace (see flint_decode.py).
         h = workspace.packed_input
         if h.numel() < max_tokens * num_topk * n * 2:
             raise ValueError("flint decode: packed_input is too small for the h rows")
-        # B2: an aborted/crashed prior eager launch on this workspace (flint's
-        # own, or a stale value from before this workspace became flint's) can
-        # leave barrier_count/barrier_epoch non-zero; flint's kernel only
-        # self-cleans on a *successful* barrier release. Mirror the
-        # volatile_launch_state-gated reset the dynamic/micro launchers do
-        # before every eager call. Under CUDA graph capture this .zero_() is
-        # itself captured (when volatile_launch_state was true at capture
-        # time), so every replay re-zeros it -- no host reset needed inside
-        # the graph, and epoch-based release still only advances once the
-        # whole grid has arrived.
+        # The kernel leaves the barrier counter at zero only after a completed
+        # launch; reset slot 0 before every eager call, as the dynamic/micro
+        # launchers do. Under capture the memsets become graph nodes.
         if workspace.volatile_launch_state:
-            workspace.barrier_count.zero_()
-            workspace.barrier_epoch.zero_()
+            workspace.barrier_count[:1].zero_()
+            workspace.barrier_epoch[:1].zero_()
         flint_args = (ptr(cutlass.Uint8, h), ptr(cutlass.Int32, workspace.barrier_count, 4),
                       ptr(cutlass.Int32, workspace.barrier_epoch, 4))
-        # B1: flint's single grid barrier (flint_decode.py's _grid_barrier)
-        # requires every launched CTA to be resident at once, unlike wm's
-        # per-expert grid. Never use _wm_grid()'s B12X_MOE_WM_GRID-capped
-        # value here -- see _flint_grid's docstring for the invariant.
-        grid_x = _flint_grid(a.device, compiled)
     scatter_output.zero_()
     if m == 0:
         return
@@ -12404,7 +12375,7 @@ def _launch_wm(
         ptr(cutlass.BFloat16, scatter_output),
         *flint_args,
         Int32(m),
-        Int32(grid_x),
+        Int32(_wm_grid(a.device)),
         current_cuda_stream(),
     )
 
@@ -12415,98 +12386,6 @@ def _wm_grid(device) -> int:
     sms = get_num_sm(device)
     cap = os.environ.get("B12X_MOE_WM_GRID", "").strip()
     return max(1, min(sms, int(cap))) if cap else sms
-
-
-def _flint_resident_ctas(device, compiled) -> int:
-    """Blocks/SM the driver guarantees for the compiled flint kernel (occupancy,
-    accounting for its own static smem/register footprint) x SM count.
-
-    This is the actual number of CTAs CUDA can hold simultaneously resident on
-    this device for this kernel -- not an assumption. flint's kernel uses no
-    dynamic shared memory (``cutlass.utils.SmemAllocator`` static allocation),
-    so the occupancy query needs no dynamic-smem argument.
-
-    # ponytail: written and reviewed without a GPU (the k19 job is held for
-    # this review); the CUkernel-unwrap mirrors program_cache.py's
-    # _local_memory_bytes exactly, but cuKernelGetFunction/
-    # cuOccupancyMaxActiveBlocksPerMultiprocessor return-tuple shapes are
-    # unverified against this exact cuda-python binding version. First GPU
-    # test run must confirm this raises cleanly (not an AttributeError) if
-    # either call's signature differs, then this note can go.
-    """
-    from b12x._lib.compile_plan import CompiledCuTeProgram
-    from b12x.moe._shared.kernels.wm_geometry import THREADS
-
-    try:
-        executable = compiled
-        if isinstance(executable, CompiledCuTeProgram):
-            executable = executable._executable
-        module = getattr(executable, "jit_module", None)
-        kernels = (
-            [entry.kernel for entry in getattr(module, "cuda_modules", ())]
-            if module is not None
-            else []
-        )
-        if not kernels:
-            raise RuntimeError("no CUDA kernel handle on the compiled executable")
-        err, func = cuda.cuKernelGetFunction(kernels[-1])
-        if int(err) != 0:
-            raise RuntimeError(f"cuKernelGetFunction failed (CUDA error {err!r})")
-        err, blocks_per_sm = cuda.cuOccupancyMaxActiveBlocksPerMultiprocessor(
-            func, THREADS, 0
-        )
-        if int(err) != 0:
-            raise RuntimeError(f"occupancy query failed (CUDA error {err!r})")
-    except Exception as exc:
-        # Fail closed: an unresolved occupancy query is exactly the "can't
-        # guarantee co-residency" case this function exists to catch, so
-        # surface it as the same refusal rather than an opaque traceback.
-        raise RuntimeError(
-            f"flint: could not determine co-resident CTA count ({exc!r}); "
-            "refusing to launch rather than assume full-grid residency"
-        ) from exc
-    return int(blocks_per_sm) * get_num_sm(device)
-
-
-def _flint_grid(device, compiled) -> int:
-    """flint's launch grid: CTAs the compiled kernel is guaranteed to hold
-    simultaneously resident on this device, capped at the SM count.
-
-    INVARIANT: flint's single grid barrier (flint_decode.py's
-    ``_grid_barrier``) requires every launched CTA to be resident at once.
-    This is never the B12X_MOE_WM_GRID-capped value ``_wm_grid`` returns for
-    ``wm`` (item schedule): that knob's documented use case -- freeing SMs for
-    a kernel on a side stream (e.g. shared experts) that overlaps the routed
-    MoE -- is unsafe for flint. A CTA that cannot be scheduled because the
-    grid was deliberately oversubscribed relative to free SMs can never reach
-    the barrier, so every already-resident CTA spins in
-    ``spin_wait_global_eq_i32`` forever. We therefore refuse outright rather
-    than silently capping.
-
-    This also fails closed (refuses to launch) if the occupancy query itself
-    cannot establish co-residency, rather than assuming ``get_num_sm(device)``
-    co-resident CTAs as the pre-review code implicitly did.
-    """
-    if os.environ.get("B12X_MOE_WM_GRID", "").strip():
-        raise RuntimeError(
-            "B12X_MOE_WM_GRID is incompatible with B12X_MOE_WM_SCHEDULE=flint: "
-            "flint's grid barrier needs full-grid residency, so capping the "
-            "grid to free SMs for a side-stream kernel (that knob's "
-            "documented use for wm) can deadlock it. Unset B12X_MOE_WM_GRID, "
-            "or use B12X_MOE_WM_SCHEDULE=item (plain wm) instead."
-        )
-    sms = get_num_sm(device)
-    resident = _flint_resident_ctas(device, compiled)
-    if resident < 1:
-        raise RuntimeError(
-            f"flint: the compiled kernel's occupancy query reports {resident} "
-            "blocks co-resident on this device; it cannot satisfy its own "
-            "grid barrier here. Use B12X_MOE_WM_SCHEDULE=item or "
-            "B12X_MOE_DECODE_BACKEND=dynamic instead."
-        )
-    grid = min(sms, resident)
-    assert grid <= resident, "flint: grid must never exceed the guaranteed co-resident CTA count"
-    return grid
 
 
 def _get_tiny_decode_kernel(

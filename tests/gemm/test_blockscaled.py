@@ -47,6 +47,22 @@ def test_regime_plan_combines_static_shapes_with_dynamic_capacity() -> None:
     }
 
 
+def test_regime_plan_pins_only_the_named_regimes() -> None:
+    query = blockscaled.BlockscaledQuery(
+        recipe="mxfp8", num_tokens=128, in_features=128, padded_in_features=128,
+        out_features=64, expected_m=None,
+    )
+    pin = blockscaled.BlockscaledConfig(mode="a16", tile_n=64, tile_k=64, split_k=2)
+
+    plan = blockscaled.plan_regimes(query, exact_m=(1, 5), overrides={5: pin})
+
+    assert plan.variants[5].override == pin
+    assert plan.variants[1].override is None
+    assert plan.variants[128].override is None
+    with pytest.raises(ValueError):
+        blockscaled.plan_regimes(query, exact_m=(5,), override=pin, overrides={5: pin})
+
+
 def _quantize_mxfp4_rows(
     source: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:

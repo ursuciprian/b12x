@@ -607,8 +607,16 @@ def plan_regimes(
     exact_m: tuple[int, ...] = (),
     invocation=FrozenMapping(),
     override=None,
+    overrides=None,
 ):
-    """Declare exact static shapes and a dynamic fallback through one execution."""
+    """Declare exact static shapes and a dynamic fallback through one execution.
+
+    ``override`` pins every regime to one config. ``overrides`` maps a row count to the
+    config pinned for that regime only (the rest stay autotuned), so a caller can pin the
+    decode-sized regimes without forcing that config onto the prefill capacity regime.
+    """
+    if override is not None and overrides:
+        raise ValueError("pass override or overrides, not both")
     if not isinstance(query, BlockscaledQuery):
         raise TypeError("packed regime planning requires BlockscaledQuery")
     if query.expected_m is not None:
@@ -626,7 +634,8 @@ def plan_regimes(
     }
     child_queries[query.num_tokens] = query
     children = {
-        rows: _plan_bf16(child, invocation=invocation, override=override)
+        rows: _plan_bf16(child, invocation=invocation,
+                         override=override if override is not None else (overrides or {}).get(rows))
         for rows, child in child_queries.items()
     }
     def assemble(states, device):

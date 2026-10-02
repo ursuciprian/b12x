@@ -280,3 +280,137 @@ def test_wm_min_tokens_control(monkeypatch):
     monkeypatch.setenv("B12X_MOE_WM_MIN_TOKENS", "29")
     with pytest.raises(ValueError):
         _control_snapshot()
+
+
+# ---------------------------------------------------------------------------
+# flint-specific GPU tests (B3/M3 interleave; deferred extremes from the
+# review's item 5). These force B12X_MOE_WM_SCHEDULE=flint themselves rather
+# than relying on flint_job.sh's outer env wrapping, so they exercise flint
+# correctly even when this file is run standalone.
+
+
+def test_flint_dynamic_interleave_shared_workspace(monkeypatch):
+    """M3/B3: dynamic and flint launches, back-to-back on one physical
+    workspace (the realistic M>32-fallback pattern), must not corrupt either
+    backend's output. Exercises B2's barrier reset directly: whichever plan
+    ran last left its own state behind on the shared scratch, and the next
+    flint call must still be correct."""
+    device = require_b12x()
+    monkeypatch.setenv("B12X_MOE_WM_SCHEDULE", "flint")
+    w = _weights(device, seed=71, per_expert_scales=False)
+    experts = _experts(w, "w13")
+    capacity = 20
+    a = (torch.randn(capacity, K, device=device) * 0.35).to(torch.bfloat16)
+    dyn = _plan(experts, capacity, "dynamic", monkeypatch)
+    flint = _plan(experts, capacity, "wm", monkeypatch)
+    ids0, weights0 = _routes(device, capacity, "spread", seed=1)
+    session = _prepare(device, (dyn, flint), a, ids0, weights0)
+    try:
+        dyn_specs = dyn.scratch_specs()
+        flint_specs = flint.scratch_specs()
+        assert [(s.shape, s.dtype) for s in dyn_specs] == [
+            (s.shape, s.dtype) for s in flint_specs
+        ], "dynamic and flint scratch layouts diverged; the shared-workspace scenario no longer applies"
+        shared_scratch = tuple(
+            torch.empty(s.shape, dtype=s.dtype, device=device) for s in dyn_specs
+        )
+
+        def run_on_shared(plan, ids, weights):
+            out = torch.full((capacity, K), float("nan"), dtype=torch.bfloat16, device=device)
+            binding = fused_moe.bind(
+                plan, a=a, topk_ids=ids, topk_weights=weights,
+                scratch=shared_scratch, output=out, input_scales_static=True,
+            )
+            fused_moe.run(binding=binding)
+            torch.cuda.synchronize(device)
+            return out
+
+        for round_idx, pattern in enumerate(("spread", "hot", "clustered", "disjoint")):
+            ids, weights = _routes(device, capacity, pattern, seed=200 + round_idx)
+            order = (dyn, flint) if round_idx % 2 == 0 else (flint, dyn)
+            for plan in order:
+                out = run_on_shared(plan, ids, weights)
+                ref = moe_reference_nvfp4(
+                    a, w["w1"], w["w1_scale"], w["w1_alpha"], w["w2"], w["w2_scale"],
+                    w["w2_alpha"], w["a1"], w["a2"], ids, weights, E, K, I,
+                    quant_scale_math="dynamic_fast",
+                ).float()
+                assert out.isfinite().all(), (pattern, plan is flint)
+                err = _rms(out.float() - ref) / _rms(ref)
+                ctx = (pattern, "flint" if plan is flint else "dynamic", err)
+                assert compare_to_reference(out.float(), ref).cos >= 0.9999 and err <= 0.015, ctx
+    finally:
+        session.__exit__(None, None, None)
+
+
+def test_flint_barrier_reuse_repeated_eager_calls(monkeypatch):
+    """100 back-to-back eager flint launches on one binding: the barrier must
+    reset/self-clean correctly every time, not just on the first call."""
+    device = require_b12x()
+    monkeypatch.setenv("B12X_MOE_WM_SCHEDULE", "flint")
+    w = _weights(device, seed=72, per_expert_scales=False)
+    experts = _experts(w, "w13")
+    capacity = 20
+    a = (torch.randn(capacity, K, device=device) * 0.35).to(torch.bfloat16)
+    ids, weights = _routes(device, capacity, "spread", seed=2)
+    flint = _plan(experts, capacity, "wm", monkeypatch)
+    session = _prepare(device, (flint,), a, ids, weights)
+    try:
+        patterns = ("spread", "clustered", "hot", "disjoint")
+        for i in range(100):
+            ids, weights = _routes(device, capacity, patterns[i % len(patterns)], seed=1000 + i)
+            out, _, _ = _run(flint, device, a, ids, weights, capacity)
+            assert out.isfinite().all(), i
+            ref = moe_reference_nvfp4(
+                a, w["w1"], w["w1_scale"], w["w1_alpha"], w["w2"], w["w2_scale"],
+                w["w2_alpha"], w["a1"], w["a2"], ids, weights, E, K, I,
+                quant_scale_math="dynamic_fast",
+            ).float()
+            err = _rms(out.float() - ref) / _rms(ref)
+            assert compare_to_reference(out.float(), ref).cos >= 0.9999 and err <= 0.015, (i, err)
+    finally:
+        session.__exit__(None, None, None)
+
+
+@pytest.mark.parametrize("capacity,minimal,label", [
+    (10, True, "D==TOPK (minimal distinct experts)"),
+    (32, False, "D>48 (maximal distinct experts)"),
+])
+def test_flint_distinct_expert_extremes(capacity, minimal, label, monkeypatch):
+    """flint's byte-balanced schedule must hold at both ends of D (distinct
+    touched experts): the floor (every token shares the same TOPK experts)
+    and well above the SM count."""
+    device = require_b12x()
+    monkeypatch.setenv("B12X_MOE_WM_SCHEDULE", "flint")
+    w = _weights(device, seed=73 + capacity, per_expert_scales=False)
+    experts = _experts(w, "w13")
+    a = (torch.randn(capacity, K, device=device) * 0.35).to(torch.bfloat16)
+    if minimal:
+        # Every token routes to the identical TOPK experts: D == TOPK, the
+        # smallest distinct-expert count flint's schedule can see.
+        gen = torch.Generator(device="cpu").manual_seed(capacity)
+        row = torch.randperm(E, generator=gen)[:TOPK]
+        ids = row.unsqueeze(0).expand(capacity, TOPK).to(torch.int32).to(device).contiguous()
+        wts = torch.rand(capacity, TOPK, generator=gen).add_(0.25)
+        weights = (wts / wts.sum(dim=1, keepdim=True)).to(device).contiguous()
+    else:
+        ids, weights = _routes(device, capacity, "spread", seed=capacity)
+    d = ids.unique().numel()
+    if minimal:
+        assert d == TOPK, (label, d)
+    else:
+        assert d > 48, (label, d, "seed did not reach the labeled distinct-expert extreme")
+    flint = _plan(experts, capacity, "wm", monkeypatch)
+    session = _prepare(device, (flint,), a, ids, weights)
+    try:
+        out, _, _ = _run(flint, device, a, ids, weights, capacity)
+        assert out.isfinite().all(), label
+        ref = moe_reference_nvfp4(
+            a, w["w1"], w["w1_scale"], w["w1_alpha"], w["w2"], w["w2_scale"],
+            w["w2_alpha"], w["a1"], w["a2"], ids, weights, E, K, I,
+            quant_scale_math="dynamic_fast",
+        ).float()
+        err = _rms(out.float() - ref) / _rms(ref)
+        assert compare_to_reference(out.float(), ref).cos >= 0.9999 and err <= 0.015, (label, d, err)
+    finally:
+        session.__exit__(None, None, None)

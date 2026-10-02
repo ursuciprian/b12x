@@ -132,11 +132,16 @@ def _bench(device, experts, backend, m, d, *, replays, shared_input, skew, label
     rotation = int(len(sets) * d * EXPERT_BYTES)
     if rotation < MIN_ROTATION_BYTES:
         raise RuntimeError(f"weight rotation {rotation >> 20} MB < 512 MB: L2 would fake bandwidth")
-    scratch = tuple(torch.empty(s.shape, dtype=s.dtype, device=device) for s in plan.scratch_specs())
+    # M1: torch.zeros, not torch.empty -- this blob holds barrier_count/barrier_epoch
+    # (and other init="zeros" arena entries, see _TensorAllocSpec/_allocate_arena_tensor
+    # in _impl.py) at internal offsets this caller-owned allocation doesn't see by name.
+    # torch.empty here can start flint's barrier at garbage from a prior CUDA allocation
+    # (e.g. a dynamic/wm run earlier in this process), which is B2's failure mode.
+    scratch = tuple(torch.zeros(s.shape, dtype=s.dtype, device=device) for s in plan.scratch_specs())
     out = torch.empty(m, K, dtype=torch.bfloat16, device=device)
 
     def factory(state):
-        sc = tuple(torch.empty(s.shape, dtype=s.dtype, device=device) for s in state.scratch.scratch_specs())
+        sc = tuple(torch.zeros(s.shape, dtype=s.dtype, device=device) for s in state.scratch.scratch_specs())
         o = torch.empty_like(a)
         b = state.bind(a=a, topk_ids=sets[0], topk_weights=weights, scratch=sc, output=o,
                        input_scales_static=True)

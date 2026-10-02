@@ -26,11 +26,28 @@ quantizers and scales, the same QMMA fragments and K order, the same FP32 split-
 reduction order, SiLU and BF16 rounding of h (the only change is that h goes
 through global memory instead of shared memory), and the same FC2 epilogue.
 
-Scratch: ``hbuf`` needs ``max_tokens * top_k * I * 2`` bytes. The launcher uses the
-dynamic workspace's ``packed_input`` (``rows_padded * K/2`` bytes, rows_padded >=
-routed rows, so it fits whenever ``2 I <= K/2``). The barrier uses slot 0 of the
-workspace's ``barrier_count`` (left at zero after every launch) and
+Scratch: ``hbuf`` needs ``max_tokens * top_k * I * 2`` bytes. The launcher uses a
+shadow-dynamic workspace's ``packed_input`` (``rows_padded * K/2`` bytes, rows_padded
+>= routed rows, so it fits whenever ``2 I <= K/2``). The barrier uses slot 0 of the
+workspace's ``barrier_count`` (left at zero on a successful release) and
 ``barrier_epoch`` (incremented once per launch).
+
+Workspace exclusivity (B3). ``packed_input``/``barrier_count``/``barrier_epoch`` are
+shared with the real ``dynamic`` backend's own grid barrier when they alias the same
+workspace; a concurrent (different-stream) ``dynamic`` or flint launch touching the
+same tensors mid-flight would race both the ``h`` rows and the barrier counter. To
+avoid this, ``_workspace_pool_key`` (``_impl.py``) gives a flint-scheduled plan (any
+shape with ``B12X_MOE_WM_SCHEDULE=flint`` active) its own pool entry, distinct from a
+plain ``dynamic`` plan or wm's item-schedule plan of the same shape -- so flint never
+resolves to the same physical tensors those use, even though the arena *layout* code
+is shared. This closes the realistic M>32-fallback aliasing case (dynamic and flint
+back-to-back on what would otherwise be "the same workspace"). It does not protect a
+caller that manually aliases scratch across two separately-bound plans outside this
+pool; that remains out of contract (same-stream ordering is still required there).
+``_launch_wm`` also resets the barrier before every eager flint launch when
+``workspace.volatile_launch_state`` is set (B2), mirroring the dynamic/micro
+launchers, in case a prior aborted launch on this same flint-dedicated workspace left
+it non-zero.
 """
 
 from __future__ import annotations

@@ -147,7 +147,8 @@ def test_a16_forced_route_mode_matches_fp32_reference(tmp_path, route_mode):
     require_b12x()
     raw = _weights()
     experts = _experts(raw)
-    counts = (5, 10, 20, 40)
+    # direct routing is planned only for exact small counts (<= 8 rows); packed covers 5..40
+    counts = (5, 8) if route_mode == "direct" else (5, 10, 20, 40)
     x, ids, weights = _inputs(max(counts))
     execution = fused_moe.plan_execution(
         experts=experts,
@@ -163,5 +164,5 @@ def test_a16_forced_route_mode_matches_fp32_reference(tmp_path, route_mode):
 
     with PreparationSession(device=x.device, autotune=False, compile_workers=2, cache_dir=tmp_path) as session:
         _prepare(session, execution, counts, x, ids, weights, check)
-        for rows in (5, 8, 10, 13, 20, 33, 40):
+        for rows in counts if route_mode == "direct" else (5, 8, 10, 13, 20, 33, 40):
             _check_rows(raw, execution, rows, x, ids, weights, 0.999)

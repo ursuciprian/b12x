@@ -108,10 +108,14 @@ class Toucher:
 
 def moe_route_sets(device, m, d, *, banks, window):
     """Call j uses bank j % banks; its M tokens route to exactly d distinct experts, a window that advances
-    by d per call through the first `window` experts of the bank. Returns [(bank, topk_ids)]."""
-    if d > window or d < TOPK or d > m * TOPK:
+    by d per call through the first `window` experts of the bank. Returns [(bank, topk_ids)].
+    One bank (the small ring): the window is rounded up to a multiple of d so consecutive calls never share
+    experts (a shared expert could still sit in L2 and flatter the small ring)."""
+    if banks == 1:
+        window = d * -(-window // d)
+    if d > window or window > E or d < TOPK or d > m * TOPK:
         raise ValueError(f"cannot route M={m} tokens to exactly {d} distinct experts in a {window}-expert window")
-    per_bank = -(-window // d) + 1
+    per_bank = window // d if banks == 1 else -(-window // d) + 1
     routes = torch.arange(m * TOPK).reshape(m, TOPK) % d
     out = []
     for i in range(per_bank):
@@ -356,14 +360,16 @@ def _report(kind, m, d, res, bytes_per_call, foot):
 
 def summarize(res):
     """TLB term and touch gain of one (kind, M) result, in us/call and fractions."""
-    best = min(res.get("r8g-same", math.inf), res.get("r8g-next", math.inf))
-    gap = res["r8g"] - res["r512"]
-    gain = res["r8g"] - best
+    # r512 runs before and after the r8g configs: their mean cancels linear clock drift
+    base = (res["r512"] + res.get("r512 again", res["r512"])) / 2
+    mode = min(("same", "next"), key=lambda k: res.get(f"r8g-{k}", math.inf))
+    gap = res["r8g"] - base
+    gain = res["r8g"] - res.get(f"r8g-{mode}", math.inf)
     return dict(
-        gap_us=gap, gap_pct=100 * gap / res["r512"], gain_us=gain, gain_frac=gain / res["r8g"],
-        cost_us=res.get("r512-next", res["r512"]) - res["r512"],
+        gap_us=gap, gap_pct=100 * gap / base, gain_us=gain, gain_frac=gain / res["r8g"],
+        cost_us=res.get(f"r512-{mode}", base) - base, mode=mode,
         recovered=gain / gap if gap > 0 else 0.0,
-        go=gap >= 0.05 * res["r512"] and gain >= 0.5 * gap,
+        go=gap >= 0.05 * base and gain >= 0.5 * gap,
     )
 
 
@@ -386,7 +392,7 @@ def projection(moe, dense, dense_m):
         if dm in dense:
             s = summarize(dense[dm])
             saved += dense_ms * s["gain_frac"]
-            cost += dense_ms * s["cost_us"] / dense[dm]["r512"]
+            cost += dense_ms * s["cost_us"] / (dense[dm]["r8g"] - s["gap_us"])
             parts.append(f"dense TLB term {s['gap_pct']:+.1f}%, touch -{dense_ms * s['gain_frac']:.2f} ms")
             go.append(f"dense {'GO' if s['go'] else 'no-go'}")
         if not parts:
@@ -421,12 +427,17 @@ def selftest():
         big = moe_route_sets("cpu", m, d, banks=7, window=E)
         for _, ids in small + big:
             assert ids.shape == (m, TOPK) and ids.unique().numel() == d and int(ids.max()) < E
-        assert ring_footprint(small, EXPERT_BYTES) == small_window * EXPERT_BYTES
+        assert ring_footprint(small, EXPERT_BYTES) == d * -(-small_window // d) * EXPERT_BYTES >= 512 << 20
+        for (_, x), (_, y) in zip(small, small[1:] + small[:1], strict=True):
+            assert not set(x.flatten().tolist()) & set(y.flatten().tolist())  # neighbours disjoint
         assert ring_footprint(big, EXPERT_BYTES) == 7 * E * EXPERT_BYTES >= 8 << 30
         assert len({b for b, _ in big[:7]}) == 7  # consecutive calls hit different banks
-    fake = {"r512": 100.0, "r8g": 110.0, "r8g-same": 104.0, "r8g-next": 103.0, "r512-next": 101.0}
+    fake = {"r512": 100.0, "r8g": 110.0, "r8g-same": 104.0, "r8g-next": 103.0, "r512-next": 101.0,
+            "r512-same": 105.0, "r512 again": 100.0}
     s = summarize(fake)
     assert abs(s["gap_pct"] - 10) < 1e-9 and abs(s["recovered"] - 0.7) < 1e-9 and s["go"]
+    assert s["mode"] == "next" and abs(s["cost_us"] - 1.0) < 1e-9
+    assert abs(summarize({**fake, "r512 again": 102.0})["gap_us"] - 9.0) < 1e-9  # drift-averaged base
     assert not summarize({**fake, "r8g": 104.0, "r8g-same": 103.0, "r8g-next": 103.5})["go"]  # 4% gap
     projection({20: fake}, {20: fake}, {20: 20})
     x = torch.arange(12, dtype=torch.float32).reshape(3, 4)

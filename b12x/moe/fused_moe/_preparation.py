@@ -376,6 +376,7 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
         props = torch.cuda.get_device_properties(core.device)
         compiler_args = dict(
             size_m=tokens, hidden_size=core.k, intermediate_size=core.n,
+            direct_token_capacity=int(caps.max_tokens),
             num_experts=core.weight_E, top_k=core.num_topk,
             activation=core.activation,
             apply_router_weight_on_input=caps.apply_router_weight_on_input,

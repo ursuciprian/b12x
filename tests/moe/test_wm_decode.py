@@ -134,10 +134,13 @@ def _prepare(device, plans, a, ids, weights):
 
 
 def _poison(tensors):
-    """Fill with 0xFF bytes (BF16 NaN): a flint h read that no write of the same launch
-    preceded turns the output NaN. Bind maps views only and run re-zeros the barrier."""
+    """Fill with 0x7F bytes (BF16 0x7F7F = 3.4e38, finite): a flint h read that no write
+    of the same launch preceded dominates its 16-channel block amax, so the output turns
+    inf or huge and fails isfinite or the error bound. NaN (0xFF) would not do: the
+    quantizer's max.f32 returns the non-NaN operand and satfinite can make the rest
+    finite. Bind maps views only and run re-zeros the barrier."""
     for t in tensors:
-        t.view(-1).view(torch.uint8).fill_(0xFF)
+        t.view(-1).view(torch.uint8).fill_(0x7F)
 
 
 def _run(plan, device, a, ids, weights, rows, poison=False):
@@ -445,8 +448,11 @@ def test_flint_matches_wm_tightly(monkeypatch):
     flint vs wm has the distribution of wm vs wm: two independent BF16 combine orders,
     about sqrt(2) x 3.2e-3 = 4.5e-3 relative RMS (module docstring). The checks
     require the global RMS difference under max(1.25 x wm's own run-to-run difference,
-    6e-3) and every row under 1e-2. One stale 16 B h vector per route-item (about 3%
-    on the affected rows) fails the row check; an unwritten h read is NaN (poison)."""
+    8e-3) and every row under 1e-2. The floor matters when wm's two runs commit their
+    atomics in the same order (noise ~ 0); 8e-3 is 1.8x the expected 4.5e-3, where 6e-3
+    was only 1.3x. Loosening it costs no detection: the global check is not what catches
+    a race. One stale 16 B h vector per route-item (about 3% on the affected rows) fails
+    the 1e-2 row check, and an unwritten h read is huge (0x7F poison)."""
     device = require_b12x()
     w = _weights(device, seed=75, per_expert_scales=True)
     experts = _experts(w, "w13")
@@ -478,7 +484,7 @@ def test_flint_matches_wm_tightly(monkeypatch):
         noise = _rms(wm2 - wm1) / scale
         row = ((fl - wm1).square().mean(1).sqrt() / wm1.square().mean(1).sqrt().clamp_min(1e-6)).max().item()
         ctx = (pattern, rows, diff, noise, row)
-        assert diff <= max(1.25 * noise, 6e-3), ctx
+        assert diff <= max(1.25 * noise, 8e-3), ctx
         assert row <= 1e-2, ctx
 
 
@@ -519,10 +525,12 @@ def test_flint_single_graph_many_replays(monkeypatch):
 
 
 def test_flint_standalone_pool_repeated_calls(monkeypatch):
-    """flint through a standalone TPMoEWorkspacePool (no shared arena), the sglang
-    path: the pool allocates and resolves one workspace under the runtime key, and 100
-    calls on it stay correct with h poisoned before each. (The run path rebuilds the
-    workspace with volatile_launch_state=True, so the barrier is still re-zeroed.)"""
+    """flint through a standalone TPMoEWorkspacePool (no shared arena): the pool
+    allocates and resolves one workspace under the runtime key, and 100 calls on it stay
+    correct with h poisoned before each. binding.run always rebuilds the workspace with
+    volatile_launch_state=True (_impl.py, the two run-path rebuilds), so the launcher
+    re-zeros the barrier before every call here too; no run path reaches the kernel's
+    own counter self-clean without that reset."""
     import b12x.moe.fused_moe._impl as tp_moe
 
     device = require_b12x()

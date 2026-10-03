@@ -12193,6 +12193,12 @@ def _wm_schedule() -> str:
     return schedule
 
 
+def _wm_max_passes() -> int:
+    from b12x.moe._shared.kernels.wm_geometry import FLINT_MAX_PASSES, WM_MAX_PASSES
+
+    return FLINT_MAX_PASSES if _wm_schedule() == "flint" else WM_MAX_PASSES
+
+
 def _wm_decode_controls() -> dict:
     """Query controls for the opt-in weight-major decode backend.
 
@@ -12204,9 +12210,11 @@ def _wm_decode_controls() -> dict:
         return {}
     if backend != "wm":
         raise ValueError(f"{_MOE_DECODE_BACKEND_ENV} must be 'wm' or unset, got {backend!r}")
+    # The default stays 32 for both schedules (unchanged keys); flint accepts up to 64.
+    limit = 16 * _wm_max_passes()
     max_tokens = int(os.environ.get(_MOE_WM_MAX_TOKENS_ENV, "32"))
-    if not 1 <= max_tokens <= 32:
-        raise ValueError(f"{_MOE_WM_MAX_TOKENS_ENV} must be within 1..32, got {max_tokens}")
+    if not 1 <= max_tokens <= limit:
+        raise ValueError(f"{_MOE_WM_MAX_TOKENS_ENV} must be within 1..{limit}, got {max_tokens}")
     controls = {"decode_backend": "wm", "wm_max_tokens": max_tokens}
     # Optional floor: small batches (e.g. the MTP draft layer at 1..4 tokens) touch few
     # experts, which leaves most CTAs of the one-CTA-per-expert wm grid idle.
@@ -12326,7 +12334,7 @@ def _launch_wm(
     from b12x.moe._shared.kernels.wm_geometry import wm_geometry
 
     geo = wm_geometry(hidden_size=k, intermediate_size=n, num_experts=weight_E,
-                      top_k=num_topk, max_tokens=max_tokens)
+                      top_k=num_topk, max_tokens=max_tokens, max_passes=_wm_max_passes())
     if (
         w13.numel() != weight_E * 2 * n * (k // 2)
         or w2.numel() != weight_E * k * (n // 2)

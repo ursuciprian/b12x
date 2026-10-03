@@ -214,7 +214,7 @@ def _wm_eligible(query: MoeDecodeQuery) -> bool:
         <= int(query.controls.get("wm_max_tokens", 32))
     ):
         return False
-    from b12x.moe._shared.kernels.wm_geometry import wm_geometry
+    from b12x.moe._shared.kernels.wm_geometry import FLINT_MAX_PASSES, WM_MAX_PASSES, wm_geometry
 
     try:
         wm_geometry(
@@ -223,6 +223,8 @@ def _wm_eligible(query: MoeDecodeQuery) -> bool:
             num_experts=query.num_experts,
             top_k=query.top_k,
             max_tokens=query.num_tokens,
+            max_passes=FLINT_MAX_PASSES if query.controls.get("wm_schedule") == "flint"
+            else WM_MAX_PASSES,
         )
     except ValueError:
         return False

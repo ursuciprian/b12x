@@ -86,8 +86,10 @@ def _routes(device, m, pattern, seed):
             row = torch.randperm(E, generator=gen)[:TOPK]
         elif pattern == "clustered":
             row = torch.randperm(24, generator=gen)[:TOPK]
-        elif pattern == "hot":  # every token shares expert 7: two passes above 16 rows
+        elif pattern == "hot":  # every token shares expert 7: ceil(m / 16) passes
             row = torch.cat([torch.tensor([7]), 8 + torch.randperm(E - 8, generator=gen)[:TOPK - 1]])
+        elif pattern == "skew":  # Zipf(1.2) popularity: uneven rows, mixed pass counts
+            row = torch.multinomial(_ZIPF, TOPK, replacement=False, generator=gen)
         else:  # disjoint cyclic, the vLLM tuning corpus
             row = (torch.arange(TOPK) + t * TOPK) % E
         rows.append(row)
@@ -95,6 +97,9 @@ def _routes(device, m, pattern, seed):
     weights = torch.rand(m, TOPK, generator=gen).add_(0.25)
     weights /= weights.sum(dim=1, keepdim=True)
     return ids.to(device).contiguous(), weights.to(device).contiguous()
+
+
+_ZIPF = 1.0 / torch.arange(1, E + 1, dtype=torch.float64) ** 1.2
 
 
 def _plan(experts, capacity, backend, monkeypatch):
@@ -557,3 +562,85 @@ def test_flint_standalone_pool_repeated_calls(monkeypatch):
         err = _rms(out.float() - ref) / _rms(ref)
         assert compare_to_reference(out.float(), ref).cos >= 0.9999 and err <= 0.015, (i, err)
     assert len(pool.workspaces) == 1, list(pool.workspaces)
+
+
+@pytest.mark.parametrize("capacity", [33, 40, 48, 64])
+def test_flint_large_m(capacity, monkeypatch):
+    """M > 32 (flint only, up to FLINT_MAX_PASSES 16-row passes per expert) against the
+    oracle, with balanced (spread, disjoint) and skewed (skew, clustered, hot) routing.
+    hot puts every token on one expert, so at rows = capacity it runs ceil(capacity / 16)
+    passes; the other rows counts cover the 16/32-row pass boundaries."""
+    device = require_b12x()
+    monkeypatch.setenv("B12X_MOE_WM_SCHEDULE", "flint")
+    monkeypatch.setenv("B12X_MOE_WM_MAX_TOKENS", "64")
+    w = _weights(device, seed=80 + capacity, per_expert_scales=True)
+    experts = _experts(w, "w13")
+    a = (torch.randn(capacity, K, device=device) * 0.35).to(torch.bfloat16)
+    ids0, weights0 = _routes(device, capacity, "spread", seed=capacity)
+    flint = _plan(experts, capacity, "wm", monkeypatch)
+    session = _prepare(device, (flint,), a, ids0, weights0)
+    # Every launch must be flint's (not the dynamic fallback above 32 tokens).
+    import b12x.moe.fused_moe._impl as tp_moe
+
+    launched = []
+    launch = tp_moe._launch_wm
+
+    def counted(**kw):
+        launched.append(kw["max_tokens"])
+        return launch(**kw)
+
+    monkeypatch.setattr(tp_moe, "_launch_wm", counted)
+    try:
+        for pattern in ("spread", "disjoint", "skew", "clustered", "hot"):
+            ids, weights = _routes(device, capacity, pattern, seed=600 + capacity + len(pattern))
+            for rows in sorted({17, 33, capacity} & set(range(1, capacity + 1))):
+                out, _, _ = _run(flint, device, a, ids, weights, rows, poison=True)
+                passes = -(-ids[:rows].flatten().long().bincount().max().item() // 16)
+                ctx = (pattern, rows, passes)
+                assert out.isfinite().all(), ctx
+                ref = _oracle(w, a[:rows], ids[:rows], weights[:rows])
+                err = _rms(out.float() - ref) / _rms(ref)
+                assert compare_to_reference(out.float(), ref).cos >= 0.9999 and err <= 0.015, ctx + (err,)
+                if pattern == "hot" and rows == capacity:
+                    assert passes == -(-capacity // 16), ctx
+        assert len(launched) == 5 * len({17, 33, capacity} & set(range(1, capacity + 1)))
+        assert set(launched) == {capacity}
+    finally:
+        session.__exit__(None, None, None)
+
+
+def test_flint_large_m_graph_replay(monkeypatch):
+    """One graph captured at capacity 64 and replayed at 40 rows (TP=1 c8, 4 MTP drafts)
+    with live routes cycling through 1..4-pass patterns and h poisoned before each."""
+    device = require_b12x()
+    monkeypatch.setenv("B12X_MOE_WM_SCHEDULE", "flint")
+    monkeypatch.setenv("B12X_MOE_WM_MAX_TOKENS", "64")
+    w = _weights(device, seed=90, per_expert_scales=False)
+    experts = _experts(w, "w13")
+    capacity, rows = 64, 40
+    a = (torch.randn(capacity, K, device=device) * 0.35).to(torch.bfloat16)
+    ids, weights = _routes(device, capacity, "spread", seed=9)
+    flint = _plan(experts, capacity, "wm", monkeypatch)
+    session = _prepare(device, (flint,), a, ids, weights)
+    try:
+        out, binding, _ = _run(flint, device, a, ids, weights, rows, poison=True)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            fused_moe.run(binding=binding)
+        patterns = ("hot", "skew", "spread", "clustered")
+        for step in range(16):
+            new_ids, new_w = _routes(device, capacity, patterns[step % len(patterns)], seed=700 + step)
+            ids.copy_(new_ids)
+            weights.copy_(new_w)
+            a.neg_()
+            out.fill_(float("nan"))
+            _poison((binding.packed_input,))
+            graph.replay()
+            torch.cuda.synchronize(device)
+            assert out.isfinite().all(), step
+            ref = _oracle(w, a[:rows], ids[:rows], weights[:rows])
+            err = _rms(out.float() - ref) / _rms(ref)
+            assert compare_to_reference(out.float(), ref).cos >= 0.9999 and err <= 0.015, (step, err)
+        graph.reset()
+    finally:
+        session.__exit__(None, None, None)

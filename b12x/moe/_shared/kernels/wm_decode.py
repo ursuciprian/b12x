@@ -7,8 +7,8 @@ resetting. See docs/moe-weight-major-decode.md for the bandwidth model.
 Every CTA ranks the touched experts itself. It reads ``topk_ids`` (at most
 ``max_tokens * top_k`` routes) into shared memory, builds a touched-expert bitmap,
 and orders the experts by ascending id. A work item is ``(expert, pass)``, where a
-pass is one 16-row block of that expert's routed rows, taken in route order. A
-second pass exists only when more than 16 rows pick the same expert. CTA ``b``
+pass is one 16-row block of that expert's routed rows, taken in route order. Pass
+p exists only when more than 16 p rows pick the same expert. CTA ``b``
 owns items ``b, b + grid, ...``. Every item streams the same bytes, which is its
 expert's full w13 and down weights exactly once, so a round of items finishes
 together.
@@ -81,6 +81,7 @@ from b12x.moe._shared.kernels.wm_geometry import (
     NUM_WARPS,
     PASS_ROWS,
     THREADS,
+    WM_MAX_PASSES,
     wm_geometry,
 )
 
@@ -142,11 +143,14 @@ def _red_add_shared(addr: Int32, val: Int32, *, loc=None, ip=None):
 class MoEWeightMajorDecodeKernel:
     """Weight-major fused NVFP4 SiLU MoE decode (see module docstring)."""
 
+    MAX_PASSES = WM_MAX_PASSES
+
     def __init__(self, *, hidden_size: int, intermediate_size: int, num_experts: int,
                  top_k: int, max_tokens: int, fast_math: bool, ids_int64: bool,
                  probe: frozenset = frozenset()):
         self.g = wm_geometry(hidden_size=hidden_size, intermediate_size=intermediate_size,
-                             num_experts=num_experts, top_k=top_k, max_tokens=max_tokens)
+                             num_experts=num_experts, top_k=top_k, max_tokens=max_tokens,
+                             max_passes=self.MAX_PASSES)
         self.fast_math = bool(fast_math)
         self.ids_int64 = bool(ids_int64)
         # Benchmark-only timing probes (wrong results): nocompute, noscale, noprologue.
@@ -201,16 +205,24 @@ class MoEWeightMajorDecodeKernel:
     # ------------------------------------------------------------------ routing
 
     @cute.jit
-    def _item_expert(self, base: Int32, item: Int32, d: Int32) -> Int32:
-        """Expert id of work item ``item`` (pass 0 below ``d``, pass 1 above)."""
+    def _item_expert(self, base: Int32, item: Int32):
+        """(expert id, pass) of work item ``item``.
+
+        Items run pass by pass (the experts with >= 1 row, then those with > 16 rows,
+        ...), each pass by ascending expert id.
+        """
         g = self.g
-        bm = base + Int32(g["off_bm"])
-        pre = base + Int32(g["off_pre"])
+        p = Int32(0)
         r = item
-        if item >= d:
-            bm = base + Int32(g["off_big"])
-            pre = base + Int32(g["off_bpre"])
-            r = item - d
+        for k in cutlass.range_constexpr(g["passes"] - 1):
+            if p == Int32(k):
+                n_k = Int32(ld_shared_u32(
+                    base + Int32(g["off_pre"] + k * g["pre_stride"] + 4 * g["bitmap_words"])))
+                if r >= n_k:
+                    r = r - n_k
+                    p = Int32(k + 1)
+        bm = base + Int32(g["off_bm"]) + p * Int32(g["bm_stride"])
+        pre = base + Int32(g["off_pre"]) + p * Int32(g["pre_stride"])
         word = Int32(0)
         for w in cutlass.range_constexpr(1, g["bitmap_words"]):
             if Int32(ld_shared_u32(pre + Int32(4 * w))) <= r:
@@ -221,7 +233,7 @@ class MoEWeightMajorDecodeKernel:
             bits = bits & (bits - Uint32(1))
             k -= Int32(1)
         low = bits & (Uint32(0) - bits)
-        return word * Int32(32) + _popc(low - Uint32(1))
+        return word * Int32(32) + _popc(low - Uint32(1)), p
 
     @cute.jit
     def _gather_pass(self, ids: cute.Tensor, tw: cute.Tensor, base: Int32, tid: Int32,
@@ -446,18 +458,18 @@ class MoEWeightMajorDecodeKernel:
     def _route_prologue(self, ids: cute.Tensor, base: Int32, tid: Int32, num_tokens: Int32):
         """Routing, redundantly in every CTA: touched-expert bitmaps and their prefix counts.
 
-        Returns (d, d2, routes): experts with >= 1 row, experts with > PASS_ROWS rows,
-        and the number of live routes.
+        Returns (items, routes): the work items over all passes, and the number of live
+        routes.
         """
         g = self.g
         E = g["E"]
         lane = tid & Int32(31)
         nw = g["bitmap_words"]
-        for i in cutlass.range_constexpr(-(-nw // THREADS)):
+        passes = g["passes"]
+        for i in cutlass.range_constexpr(-(-(nw * passes) // THREADS)):
             w = tid + Int32(i * THREADS)
-            if w < Int32(nw):
+            if w < Int32(nw * passes):
                 st_shared_u32(base + Int32(g["off_bm"]) + w * Int32(4), Uint32(0))
-                st_shared_u32(base + Int32(g["off_big"]) + w * Int32(4), Uint32(0))
         if cutlass.const_expr(g["passes"] > 1):
             for i in cutlass.range_constexpr(-(-E // THREADS)):
                 ez = tid + Int32(i * THREADS)
@@ -477,19 +489,22 @@ class MoEWeightMajorDecodeKernel:
                     if cutlass.const_expr(g["passes"] > 1):
                         _red_add_shared(base + Int32(g["off_cnt"]) + route_e * Int32(4), Int32(1))
         cute.arch.sync_threads()
-        if cutlass.const_expr(g["passes"] > 1):
+        if cutlass.const_expr(passes > 1):
             for i in cutlass.range_constexpr(-(-E // THREADS)):
                 eb = tid + Int32(i * THREADS)
                 if eb < Int32(E):
-                    if Int32(ld_shared_u32(base + Int32(g["off_cnt"]) + eb * Int32(4))) > Int32(PASS_ROWS):
-                        _red_or_shared(base + Int32(g["off_big"]) + (eb >> Int32(5)) * Int32(4),
-                                       Uint32(1) << Uint32(eb & Int32(31)))
+                    n_e = Int32(ld_shared_u32(base + Int32(g["off_cnt"]) + eb * Int32(4)))
+                    for k in cutlass.range_constexpr(1, passes):
+                        if n_e > Int32(k * PASS_ROWS):
+                            _red_or_shared(base + Int32(g["off_bm"] + k * g["bm_stride"])
+                                           + (eb >> Int32(5)) * Int32(4),
+                                           Uint32(1) << Uint32(eb & Int32(31)))
             cute.arch.sync_threads()
-        # Exclusive prefix popcounts of both bitmaps (warp 0; nw <= 32).
+        # Exclusive prefix popcounts of every pass bitmap (warp 0; nw <= 32).
         if tid < Int32(32):
-            for which in cutlass.range_constexpr(2):
-                bm_off = g["off_bm"] if which == 0 else g["off_big"]
-                pre_off = g["off_pre"] if which == 0 else g["off_bpre"]
+            for which in cutlass.range_constexpr(passes):
+                bm_off = g["off_bm"] + which * g["bm_stride"]
+                pre_off = g["off_pre"] + which * g["pre_stride"]
                 cnt = Int32(0)
                 if lane < Int32(nw):
                     cnt = _popc(ld_shared_u32(base + Int32(bm_off) + lane * Int32(4)))
@@ -503,9 +518,10 @@ class MoEWeightMajorDecodeKernel:
                 if lane == Int32(nw - 1):
                     st_shared_u32(base + Int32(pre_off) + Int32(4 * nw), Uint32(incl))
         cute.arch.sync_threads()
-        d = Int32(ld_shared_u32(base + Int32(g["off_pre"] + 4 * nw)))
-        d2 = Int32(ld_shared_u32(base + Int32(g["off_bpre"] + 4 * nw)))
-        return d, d2, routes
+        items = Int32(0)
+        for k in cutlass.range_constexpr(passes):
+            items += Int32(ld_shared_u32(base + Int32(g["off_pre"] + k * g["pre_stride"] + 4 * nw)))
+        return items, routes
 
     # ------------------------------------------------------------------ stage compute
 
@@ -676,8 +692,7 @@ class MoEWeightMajorDecodeKernel:
         storage = smem.allocate(Storage)
         base = shared_ptr_to_u32(storage.words.data_ptr())
 
-        d, d2, routes = self._route_prologue(ids, base, tid, num_tokens)
-        items = d + d2
+        items, routes = self._route_prologue(ids, base, tid, num_tokens)
         mine = Int32(0)
         if bid < items:
             mine = (items - bid + grid - Int32(1)) // grid
@@ -687,7 +702,7 @@ class MoEWeightMajorDecodeKernel:
         # ---- the per-CTA stage stream
         iss_e = Int32(0)
         if mine > Int32(0):
-            iss_e = self._item_expert(base, bid, d)
+            iss_e = self._item_expert(base, bid)[0]
         stages = g["stages"]
         for s0 in cutlass.range_constexpr(stages - 1):
             if Int32(s0) < total:
@@ -702,11 +717,7 @@ class MoEWeightMajorDecodeKernel:
             j = step // spi
             s = step - j * spi
             if s == Int32(0):
-                item = bid + j * grid
-                cur_e = self._item_expert(base, item, d)
-                pass_idx = Int32(0)
-                if item >= d:
-                    pass_idx = Int32(1)
+                cur_e, pass_idx = self._item_expert(base, bid + j * grid)
                 if cutlass.const_expr("noprologue" not in self.probe):
                     self._gather_pass(ids, tw, base, tid, cur_e, pass_idx, routes)
                     cute.arch.sync_threads()
@@ -719,7 +730,7 @@ class MoEWeightMajorDecodeKernel:
                 nj = nxt // spi
                 ns = nxt - nj * spi
                 if ns == Int32(0):
-                    iss_e = self._item_expert(base, bid + nj * grid, d)
+                    iss_e = self._item_expert(base, bid + nj * grid)[0]
                 self._issue_stage(w13, sf13, w2, sf2, base, tid, iss_e, ns, nxt % Int32(stages))
             cute.arch.cp_async_commit_group()
             cute.arch.cp_async_wait_group(stages - 1)

@@ -21,6 +21,12 @@ flint splits every call into equal byte ranges over all CTAs:
 Weight addresses depend only on routing, so the cp.async ring keeps prefetching the
 first FC2 stages while the CTA waits at the barrier.
 
+Up to 64 tokens (``FLINT_MAX_PASSES`` 16-row passes; ``wm`` stops at two). An item is
+(expert, pass) as in ``wm``, and pass p exists for the experts with more than 16 p
+rows. Every item streams the expert's full weights, so a pass costs the same bytes as
+a new expert and the byte split stays balanced. The tiles, quantizers and QMMA are
+the 16-row ``wm`` ones, so the numerics do not depend on the pass count.
+
 Numerics equal ``wm`` exactly up to the order of the output atomics: the same
 quantizers and scales, the same QMMA fragments and K order, the same FP32 split-K
 reduction order, SiLU and BF16 rounding of h (the only change is that h goes
@@ -67,11 +73,13 @@ from b12x._lib.intrinsics import (
     threadfence,
 )
 from b12x.moe._shared.kernels.wm_decode import MoEWeightMajorDecodeKernel
-from b12x.moe._shared.kernels.wm_geometry import THREADS, flint_geometry
+from b12x.moe._shared.kernels.wm_geometry import FLINT_MAX_PASSES, THREADS, flint_geometry
 
 
 class MoEFlintDecodeKernel(MoEWeightMajorDecodeKernel):
     """Byte-balanced two-phase NVFP4 SiLU MoE decode (see module docstring)."""
+
+    MAX_PASSES = FLINT_MAX_PASSES
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -80,7 +88,8 @@ class MoEFlintDecodeKernel(MoEWeightMajorDecodeKernel):
 
     @property
     def __cache_key__(self):
-        return ("flint_decode", 2) + super().__cache_key__[1:]
+        # 2: cooperative launch; 3: up to FLINT_MAX_PASSES passes (64 tokens).
+        return ("flint_decode", 3) + super().__cache_key__[1:]
 
     @cute.jit
     def __call__(
@@ -202,7 +211,7 @@ class MoEFlintDecodeKernel(MoEWeightMajorDecodeKernel):
 
     @cute.jit
     def _issue_step(self, w13: cute.Tensor, sf13: cute.Tensor, w2: cute.Tensor, sf2: cute.Tensor,
-                    base: Int32, tid: Int32, d: Int32, a0: Int32, b0: Int32, n_a: Int32,
+                    base: Int32, tid: Int32, a0: Int32, b0: Int32, n_a: Int32,
                     step: Int32, slot: Int32):
         item = Int32(0)
         ws = Int32(0)
@@ -210,7 +219,7 @@ class MoEFlintDecodeKernel(MoEWeightMajorDecodeKernel):
             item, ws = self._map_a(a0, step)
         else:
             item, ws = self._map_b(b0, step - n_a)
-        self._issue_stage(w13, sf13, w2, sf2, base, tid, self._item_expert(base, item, d), ws, slot)
+        self._issue_stage(w13, sf13, w2, sf2, base, tid, self._item_expert(base, item)[0], ws, slot)
 
     @cute.kernel
     def kernel(
@@ -255,8 +264,7 @@ class MoEFlintDecodeKernel(MoEWeightMajorDecodeKernel):
         storage = smem.allocate(Storage)
         base = shared_ptr_to_u32(storage.words.data_ptr())
 
-        d, d2, routes = self._route_prologue(ids, base, tid, num_tokens)
-        items = d + d2
+        items, routes = self._route_prologue(ids, base, tid, num_tokens)
         ua = items * Int32(g["fc1_units"])
         ub = items * Int32(g["fc2_units"])
         a0 = bid * ua // grid
@@ -268,7 +276,7 @@ class MoEFlintDecodeKernel(MoEWeightMajorDecodeKernel):
         stages = g["stages"]
         for s0 in cutlass.range_constexpr(stages - 1):
             if Int32(s0) < total:
-                self._issue_step(w13, sf13, w2, sf2, base, tid, d, a0, b0, n_a, Int32(s0), Int32(s0))
+                self._issue_step(w13, sf13, w2, sf2, base, tid, a0, b0, n_a, Int32(s0), Int32(s0))
             cute.arch.cp_async_commit_group()
 
         cur_item = Int32(-1)
@@ -287,10 +295,7 @@ class MoEFlintDecodeKernel(MoEWeightMajorDecodeKernel):
                     cur_item = Int32(-1)
             if item != cur_item:
                 cur_item = item
-                cur_e = self._item_expert(base, item, d)
-                pass_idx = Int32(0)
-                if item >= d:
-                    pass_idx = Int32(1)
+                cur_e, pass_idx = self._item_expert(base, item)
                 self._gather_pass(ids, tw, base, tid, cur_e, pass_idx, routes)
                 cute.arch.sync_threads()
                 n_rows = Int32(ld_shared_u32(base + Int32(g["off_nrows"])))
@@ -303,7 +308,7 @@ class MoEFlintDecodeKernel(MoEWeightMajorDecodeKernel):
 
             nxt = step + Int32(stages - 1)
             if nxt < total:
-                self._issue_step(w13, sf13, w2, sf2, base, tid, d, a0, b0, n_a, nxt, nxt % Int32(stages))
+                self._issue_step(w13, sf13, w2, sf2, base, tid, a0, b0, n_a, nxt, nxt % Int32(stages))
             cute.arch.cp_async_commit_group()
             cute.arch.cp_async_wait_group(stages - 1)
             cute.arch.fence_proxy("async.shared", space="cta")

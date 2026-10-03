@@ -9,6 +9,8 @@ from __future__ import annotations
 
 # Fixed tiling (see the module docstring). The pass width is the QMMA M16 atom.
 PASS_ROWS = 16
+WM_MAX_PASSES = 2  # wm: up to 32 tokens
+FLINT_MAX_PASSES = 4  # flint: up to 64 tokens (TP=1 c8 with 4 MTP drafts is 40)
 FC1_ROWS = 8  # one FC1 stage = 8 full contiguous w13 rows (LPDDR row locality)
 FC2_ROWS = 64  # default FC2 stage rows (TP=2 widths); see RING_CHOICES
 NUM_WARPS = 4
@@ -22,13 +24,16 @@ RING_CHOICES = ((64, 5), (32, 5), (32, 4))
 
 
 def wm_geometry(*, hidden_size: int, intermediate_size: int, num_experts: int,
-                top_k: int, max_tokens: int) -> dict:
-    """Static geometry shared by the kernel, the launcher and the CPU mirror tests."""
+                top_k: int, max_tokens: int, max_passes: int = WM_MAX_PASSES) -> dict:
+    """Static geometry shared by the kernel, the launcher and the CPU mirror tests.
+
+    ``max_passes`` caps the 16-row passes per expert, so max_tokens <= 16 * max_passes.
+    """
     last = None
     for fc2_rows, stages in RING_CHOICES:
         try:
             return _wm_geometry(hidden_size, intermediate_size, num_experts, top_k,
-                                max_tokens, fc2_rows, stages)
+                                max_tokens, fc2_rows, stages, max_passes)
         except _SmemOverflow as exc:
             last = exc
     raise ValueError(str(last))
@@ -39,7 +44,7 @@ class _SmemOverflow(ValueError):
 
 
 def _wm_geometry(hidden_size, intermediate_size, num_experts, top_k, max_tokens,
-                 fc2_rows, stages) -> dict:
+                 fc2_rows, stages, max_passes) -> dict:
     K, I, E = int(hidden_size), int(intermediate_size), int(num_experts)
     if K % (64 * NUM_WARPS) or K % 128 or K % fc2_rows:
         raise ValueError(f"wm decode needs hidden_size % {64 * NUM_WARPS} == 0, got {K}")
@@ -47,8 +52,8 @@ def _wm_geometry(hidden_size, intermediate_size, num_experts, top_k, max_tokens,
         raise ValueError(f"wm decode needs intermediate_size % 64 == 0, got {I}")
     if E % 32 or E > 1024:
         raise ValueError(f"wm decode needs num_experts % 32 == 0 and <= 1024, got {E}")
-    if not 1 <= max_tokens <= 2 * PASS_ROWS:
-        raise ValueError(f"wm decode supports 1..{2 * PASS_ROWS} tokens, got {max_tokens}")
+    if not 1 <= max_tokens <= max_passes * PASS_ROWS:
+        raise ValueError(f"wm decode supports 1..{max_passes * PASS_ROWS} tokens, got {max_tokens}")
     g = dict(K=K, I=I, E=E, top_k=int(top_k), max_tokens=int(max_tokens),
              fc2_rows=int(fc2_rows), stages=int(stages))
     g["passes"] = -(-max_tokens // PASS_ROWS)
@@ -84,6 +89,10 @@ def _wm_geometry(hidden_size, intermediate_size, num_experts, top_k, max_tokens,
     g["routes"] = max_tokens * top_k
     g["route_chunks"] = -(-g["routes"] // 32)
     g["bitmap_words"] = E // 32
+    # One touched-expert bitmap per pass (bit e of bitmap p: expert e has > 16 p rows),
+    # each with its exclusive prefix popcounts and the total at index bitmap_words.
+    g["bm_stride"] = 4 * g["bitmap_words"]
+    g["pre_stride"] = 4 * (g["bitmap_words"] + 1)
     off = 0
     for name, size in (
         ("ring", stages * g["slot_bytes"]),
@@ -92,10 +101,8 @@ def _wm_geometry(hidden_size, intermediate_size, num_experts, top_k, max_tokens,
         ("h", PASS_ROWS * I * 2),
         # Routing counts are dead after the prologue; the FC1 split-K partials reuse them.
         ("cnt", max(4 * E if g["passes"] > 1 else 16, 2 * NUM_WARPS * PASS_ROWS * FC1_ROWS * 4)),
-        ("bm", 4 * g["bitmap_words"]),
-        ("big", 4 * g["bitmap_words"]),
-        ("pre", 4 * (g["bitmap_words"] + 4)),
-        ("bpre", 4 * (g["bitmap_words"] + 4)),
+        ("bm", g["passes"] * g["bm_stride"]),
+        ("pre", g["passes"] * g["pre_stride"]),
         ("tok", 4 * PASS_ROWS),
         ("wgt", 4 * PASS_ROWS),
         ("nrows", 16),
@@ -131,7 +138,8 @@ def wm_scale_offset(row, k64, *, atom_bytes: int):
 
 
 def flint_geometry(g: dict) -> dict:
-    """``wm`` geometry plus flint's shared route-position table."""
+    """``wm`` geometry (built with ``max_passes=FLINT_MAX_PASSES``) plus flint's shared
+    route-position table."""
     g = dict(g)
     g["off_route"] = g["smem_bytes"]
     g["smem_bytes"] += 4 * PASS_ROWS

@@ -115,12 +115,16 @@ def bench(device, experts, backend, m, d, *, replays, shared_input, skew=0.0):
     os.environ["B12X_WM_TIMING_PROBE"] = probe.replace("+", ",")
     if backend == "flint":
         os.environ["B12X_MOE_WM_SCHEDULE"] = "flint"
+        if m > 32:  # flint takes up to 64 tokens; the wm cap defaults to 32
+            os.environ["B12X_MOE_WM_MAX_TOKENS"] = str(m)
     try:
         return _bench(device, experts, backend, m, d, replays=replays, shared_input=shared_input,
                       skew=skew, label=backend + (":" + probe if probe else ""))
     finally:
         os.environ.pop("B12X_WM_TIMING_PROBE", None)
         os.environ.pop("B12X_MOE_WM_SCHEDULE", None)
+        if backend == "flint" and m > 32:
+            os.environ.pop("B12X_MOE_WM_MAX_TOKENS", None)
 
 
 def _bench(device, experts, backend, m, d, *, replays, shared_input, skew, label):

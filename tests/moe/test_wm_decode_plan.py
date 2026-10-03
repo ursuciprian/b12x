@@ -15,6 +15,7 @@ import torch
 from b12x.moe._shared.kernels.wm_geometry import (
     FC1_ROWS,
     FC2_ROWS,
+    FLINT_MAX_PASSES,
     PASS_ROWS,
     THREADS,
     wm_geometry,
@@ -117,15 +118,14 @@ def test_item_stages_stream_every_expert_byte_once(max_tokens, shape):
     assert g["spi"] == g["fc1_stages"] + K // g["fc2_rows"]
 
 
-def _mirror_items(ids: list[int], num_experts: int):
-    """In-CTA routing: bitmap ranks, second-pass map, and the item -> expert walk."""
-    words = [0] * (num_experts // 32)
-    big = [0] * (num_experts // 32)
+def _mirror_items(ids: list[int], num_experts: int, passes: int = 2):
+    """In-CTA routing: per-pass bitmap ranks and the item -> (expert, pass) walk."""
+    bms = [[0] * (num_experts // 32) for _ in range(passes)]
     cnt = Counter(e for e in ids if 0 <= e < num_experts)
     for e in cnt:
-        words[e >> 5] |= 1 << (e & 31)
-        if cnt[e] > PASS_ROWS:
-            big[e >> 5] |= 1 << (e & 31)
+        for p in range(passes):
+            if cnt[e] > PASS_ROWS * p:
+                bms[p][e >> 5] |= 1 << (e & 31)
 
     def prefix(bm):
         out, run = [], 0
@@ -134,11 +134,15 @@ def _mirror_items(ids: list[int], num_experts: int):
             run += bin(w).count("1")
         return out + [run]
 
-    pre, bpre = prefix(words), prefix(big)
-    d = pre[-1]
+    pres = [prefix(bm) for bm in bms]
 
     def item_expert(item):
-        bm, pr, r = (words, pre, item) if item < d else (big, bpre, item - d)
+        p, r = 0, item
+        for k in range(passes - 1):
+            if p == k and r >= pres[k][-1]:
+                r -= pres[k][-1]
+                p = k + 1
+        bm, pr = bms[p], pres[p]
         word = 0
         for w in range(1, len(bm)):
             if pr[w] <= r:
@@ -147,41 +151,51 @@ def _mirror_items(ids: list[int], num_experts: int):
         while k > 0:
             bits &= bits - 1
             k -= 1
-        return word * 32 + ((bits & -bits) - 1).bit_count()
+        return word * 32 + ((bits & -bits) - 1).bit_count(), p
 
     items = []
-    for item in range(d + bpre[-1]):
-        e = item_expert(item)
-        p = 0 if item < d else 1
+    for item in range(sum(pr[-1] for pr in pres)):
+        e, p = item_expert(item)
         hits = [i for i, x in enumerate(ids) if x == e]
         items.append((e, p, hits[PASS_ROWS * p: PASS_ROWS * (p + 1)]))
     return items
 
 
-@pytest.mark.parametrize("seed", range(6))
-@pytest.mark.parametrize("m", [1, 5, 13, 20, 32])
+@pytest.mark.parametrize("seed", range(8))
+@pytest.mark.parametrize("m", [1, 5, 13, 20, 32, 33, 40, 48, 64])
 def test_items_cover_every_route_once(seed, m):
     rng = random.Random(seed * 101 + m)
     E, topk = 512, 10
-    pattern = seed % 3
+    pattern = seed % 4
+    zipf = [1.0 / (i + 1) ** 1.2 for i in range(E)]
     ids = []
     for t in range(m):
         if pattern == 0:
             row = rng.sample(range(E), topk)           # spread
         elif pattern == 1:
             row = rng.sample(range(24), topk)          # clustered, shared experts
-        else:
-            row = [7] + rng.sample(range(8, E), topk - 1)  # one hot expert: 2 passes
+        elif pattern == 2:
+            row = [7] + rng.sample(range(8, E), topk - 1)  # one hot expert: ceil(m / 16) passes
+        else:                                          # Zipf(1.2) skew: mixed pass counts
+            row = []
+            while len(row) < topk:
+                e = rng.choices(range(E), zipf)[0]
+                if e not in row:
+                    row.append(e)
         if t == m - 1 and m > 1:
             row[-1] = -1                               # masked route
         ids.extend(row)
-    items = _mirror_items(ids, E)
+    # m > 32 is flint only (FLINT_MAX_PASSES); wm keeps two passes.
+    passes = wm_geometry(**QWEN, max_tokens=m, max_passes=FLINT_MAX_PASSES)["passes"]
+    items = _mirror_items(ids, E, passes)
     experts = [e for e, p, _ in items if p == 0]
     assert experts == sorted(set(e for e in ids if e >= 0))
     covered = Counter(i for _, _, rows in items for i in rows)
     assert set(covered.values()) <= {1}
     assert sorted(covered) == [i for i, e in enumerate(ids) if e >= 0]
     assert all(1 <= len(rows) <= PASS_ROWS for _, _, rows in items)
+    if pattern == 2:
+        assert max(p for _, p, _ in items) == passes - 1
     for grid in (1, 7, 48):
         owned = [i for b in range(grid) for i in range(b, len(items), grid)]
         assert sorted(owned) == list(range(len(items)))

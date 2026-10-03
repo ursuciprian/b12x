@@ -79,7 +79,8 @@ split. Every call is cut into equal byte ranges over all CTAs, whatever D is:
 
 1. **Routing.** Every CTA builds the touched-expert bitmaps from `topk_ids` in shared
    memory. This is `wm`'s prologue, now `_route_prologue`. An item is (expert, 16-row
-   pass), as in `wm`.
+   pass), as in `wm`. Pass p exists for the experts with more than 16 p rows; flint
+   allows 4 passes (64 tokens), `wm` 2 (see M > 32 below).
 2. **Phase A (FC1).** The unit is (item, 8-channel block): 8 up rows and the same 8 gate
    rows over full K. These are two `wm` FC1 stages of 10 KB contiguous payload plus
    1,280 B of scales each. The `items x 80` units are cut into 48 contiguous ranges that
@@ -106,6 +107,29 @@ design. The per-expert fusion is what ties a CTA to a whole expert and creates t
 round tail, so flint gives it up. The intermediate is M x 10 x 640 BF16 (256 KB at M=20)
 and stays in L2.
 
+### M > 32 (up to 64 tokens)
+
+TP=1 c8 with 4 MTP drafts is M=40, above `wm`'s two 16-row passes. flint keeps the 16-row
+pass and allows `FLINT_MAX_PASSES` = 4 of them, so the tiles, quantizers, QMMA and h
+relay are unchanged; only the routing prologue grows:
+
+- one touched-expert bitmap per pass (bit e of bitmap p: expert e has > 16 p rows),
+  each with its prefix popcounts, filled from the per-expert counts the two-pass
+  prologue already builds;
+- items run pass by pass, each pass by ascending expert id; `_item_expert` walks the
+  pass totals to map an item to (expert, pass).
+
+Every item streams its expert's full weights, so an extra pass costs exactly one more
+expert's bytes and the byte split over CTAs stays balanced. Shared memory grows by
+128 B per pass (I=640: 96,800 B at M=64; I=320: 101,152 B, 224 B under the 101,376 B
+opt-in limit), so the grid stays at 1 CTA/SM. The h scratch is `routes x I x 2` =
+819,200 B at M=64, I=640, which equals `packed_input`'s `routes x K/2`, so it still
+fits. At 64 tokens `_gather_pass` (warp 0) holds 20 route chunks.
+
+32-row passes (two M16 QMMAs per weight fragment) would avoid re-streaming a hot
+expert, but need a second 20 KB A tile and h tile; shared memory has no room for that
+at either width. `wm` itself stays at 32 tokens.
+
 ### Numerics
 
 flint matches `wm` except for the order of the output atomics. Both kernels use the same
@@ -120,21 +144,31 @@ combine noise (`tests/moe/test_wm_decode.py`).
   `dynamic` and against the FP32-accumulating NVFP4 oracle (`moe_reference_nvfp4`). It
   covers capacities 5/20/32, the spread/clustered/hot (two-pass)/disjoint routing
   patterns, w31 storage, and graph replay with live route changes and no replay
-  allocation, at I=640 and I=320. Scratch is filled with 0xFF (BF16 NaN) before every
-  flint call, so an h read without a same-launch write shows up as NaN. flint-specific
+  allocation, at I=640 and I=320. Scratch is filled with 0x7F (BF16 3.4e38) before
+  every flint call, so an h read without a same-launch write dominates its block amax
+  and blows up the output. (0xFF NaN is not reliable: the quantizer's `max.f32` drops
+  NaN operands.) flint-specific
   tests add a direct flint-vs-wm check (same inputs; bounded by wm's own BF16 combine
   noise), 60 replays of one captured graph, a standalone `TPMoEWorkspacePool`, and
-  dynamic/flint interleaved on one scratch.
-- `tests/moe/test_flint_geometry.py` (CPU) checks shared memory, scratch fit, that the
-  ranges tile the work with at most one unit of imbalance, and the selection controls.
+  dynamic/flint interleaved on one scratch. `test_flint_large_m` covers M = 33, 40,
+  48, 64 against the oracle with balanced (spread, disjoint) and skewed (Zipf 1.2,
+  clustered, one hot expert up to 4 passes) routing, and a graph captured at capacity
+  64 is replayed at 40 rows.
+- `tests/moe/test_flint_geometry.py` (CPU) checks shared memory up to M=64, scratch fit,
+  that the ranges tile the work with at most one unit of imbalance, and the selection
+  controls. `tests/moe/test_wm_decode_plan.py` mirrors the per-pass bitmaps and the
+  item walk and checks that the items cover every route once up to M=64.
 
 ### Plan and cache-key integration
 
 - Selection: `B12X_MOE_DECODE_BACKEND=wm` plus `B12X_MOE_WM_SCHEDULE=flint`. The
   schedule joins the wm query controls (`wm_schedule`) only when set, so the default
   and plain-wm keys stay byte-identical. The kernel cache key is
-  `("flint_decode", 2, ...)` (2: cooperative launch), compiled under
+  `("flint_decode", 3, ...)` (2: cooperative launch; 3: up to 4 passes), compiled under
   `integration.tp_moe.flint_decode` and precompiled by the same preparation path as `wm`.
+- Token cap: `B12X_MOE_WM_MAX_TOKENS` still defaults to 32 for both schedules (unchanged
+  keys). Under flint it accepts up to 64; set it to 64 (or 40) to route M = 33..64 to
+  flint instead of the dynamic fallback. It is already declared in `vllm/envs.py`.
 - Scratch: no new allocation. h uses the shadow dynamic workspace's `packed_input`
   (rows_padded x K/2 bytes, which holds routes x I x 2 whenever 2I <= K/2). The barrier
   uses `barrier_count` / `barrier_epoch`. These are the same bytes `dynamic`'s grid
@@ -163,6 +197,7 @@ memset):
 | 10 | 60 | 802 | ~715 | -11% |
 | 20 | 96 | 1,194-1,257 | ~1,140 | -5..-9% |
 | 32 | 133 | ~1,700 | ~1,575 | ~-7% |
+| 40 | 151 | not measured | ~1,790 (+12 per extra pass) | |
 
 In serving, D varies per call, so dynamic pays its round tail on average and flint does
 not. The serving gain should therefore be at least the bench gain at the same mean D.
@@ -170,8 +205,6 @@ At c4 (48 layers) -100 us/layer is -4.8 ms/step.
 
 ## Not done (and why)
 
-- **M > 32** (c8 at 4 drafts is M=40): `wm` geometry allows two 16-row passes. Supporting
-  it needs a third pass, or 32-row passes (QMMA M16 x 2).
 - **Packed scales** (base byte + 4-bit delta per 8-block group): 99.4% of groups fit
   losslessly (measured on layers 3/24/45, entropy 3.4 bits) and the change would save 4.2%
   of bytes. A second copy costs 7.5 GB at TP=1, which is not available. The prefill

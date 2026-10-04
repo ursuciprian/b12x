@@ -53,6 +53,7 @@ class GdnQuery:
     norm_weight_dtype: str = "bfloat16"
     state_indices_dtype: str = "int32"
     deferred_checkpoints: bool = False
+    external_records: bool = False
     kda_strides: tuple[int, ...] | None = None
     pointer_alignments: FrozenMapping | None = None
     recover_speculative_state: bool = False
@@ -79,7 +80,13 @@ class GdnQuery:
         object.__setattr__(self, "pointer_alignments", FrozenMapping(alignments))
 
     def to_dict(self) -> dict[str, object]:
-        return {name: getattr(self, name) for name in self.__dataclass_fields__}
+        # external_records only appears when on, so the off payload (and any
+        # identity derived from it) is unchanged from before the knob existed.
+        return {
+            name: getattr(self, name)
+            for name in self.__dataclass_fields__
+            if name != "external_records" or self.external_records
+        }
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -161,6 +168,10 @@ def _validate_query(query: GdnQuery, _device: DeviceIdentity | None) -> None:
             "deferred GDN checkpoints require Qwen heads, FP32 state, and no "
             "null state index"
         )
+    if type(query.external_records) is not bool:
+        raise TypeError("external_records must be boolean")
+    if query.external_records and not query.deferred_checkpoints:
+        raise ValueError("external GDN records require deferred checkpoints")
     if query.null_state_index is not None and (
         type(query.null_state_index) is not int or not -(1 << 63) <= query.null_state_index < (1 << 63)
     ):
@@ -216,10 +227,12 @@ def _tuning_parameters(query: GdnQuery, device):
 # (``_cute_kernels._binding_key``). Keeping both out of the key is what lets
 # this land without bumping ``query_schema_version`` /
 # ``config_schema_version``, so no persisted selection for
-# ``sequence.gdn_decode`` misses on the next boot.
+# ``sequence.gdn_decode`` misses on the next boot. External records are the
+# same kind of knob.
 _KEY_FIELDS = frozenset(GdnQuery.__dataclass_fields__) - {
     "max_state_slots",
     "deferred_checkpoints",
+    "external_records",
 }
 
 

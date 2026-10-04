@@ -264,7 +264,7 @@ def _gated_rmsnorm_kernel(
 
 @torch.library.custom_op(
     "b12x::gdn_decode",
-    mutates_args=("recurrent_state", "output"),
+    mutates_args=("recurrent_state", "output", "records"),
 )
 def _gdn_decode_op(
     mixed_qkv: torch.Tensor, a: torch.Tensor, b: torch.Tensor, z: torch.Tensor,
@@ -273,12 +273,13 @@ def _gdn_decode_op(
     num_accepted_tokens: torch.Tensor, state_indices: torch.Tensor,
     num_seqs: torch.Tensor, num_tokens: torch.Tensor, output: torch.Tensor,
     eps: float, scale: float, lower_bound: float, plan_handle: int,
+    records: torch.Tensor | None = None,
 ) -> None:
     state = require_prepared(plan_from_handle(plan_handle), "attention.gdn", mixed_qkv.device)
     state.run_tensors(
         mixed_qkv, a, b, z, A_log, dt_bias, norm_weight, recurrent_state,
         query_start_loc, num_accepted_tokens, state_indices, num_seqs, num_tokens,
-        output, eps=eps, scale=scale, lower_bound=lower_bound,
+        output, eps=eps, scale=scale, lower_bound=lower_bound, records=records,
     )
 
 
@@ -290,14 +291,19 @@ def _gdn_decode_fake(
     num_accepted_tokens: torch.Tensor, state_indices: torch.Tensor,
     num_seqs: torch.Tensor, num_tokens: torch.Tensor, output: torch.Tensor,
     eps: float, scale: float, lower_bound: float, plan_handle: int,
+    records: torch.Tensor | None = None,
 ) -> None:
     del mixed_qkv, a, b, z, A_log, dt_bias, norm_weight, recurrent_state
     del query_start_loc, num_accepted_tokens, state_indices, num_seqs, num_tokens
-    del output, eps, scale, lower_bound, plan_handle
+    del output, eps, scale, lower_bound, plan_handle, records
 
 
-def run_gdn_decode(*tensors, eps, scale, lower_bound, plan):
-    torch.ops.b12x.gdn_decode(*tensors, float(eps), float(scale), float(lower_bound), plan.handle)
+def run_gdn_decode(*tensors, eps, scale, lower_bound, plan, records=None):
+    args = (*tensors, float(eps), float(scale), float(lower_bound), plan.handle)
+    if records is None:
+        torch.ops.b12x.gdn_decode(*args)
+    else:
+        torch.ops.b12x.gdn_decode(*args, records)
 
 
 __all__ = ["run_gdn_decode"]

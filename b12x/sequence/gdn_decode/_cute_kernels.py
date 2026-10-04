@@ -24,7 +24,7 @@ from b12x._lib.intrinsics import fma_rn_f32, mul_rn_f32, warp_reduce
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils import current_cuda_stream, make_ptr
 
-from ._impl import Binding
+from ._impl import RECORD_FLOATS_PER_VALUE_HEAD, Binding
 
 
 _KEY_DIM = 128
@@ -44,7 +44,8 @@ _VALUE_TILES = _VALUE_DIM // _VALUE_ROWS_PER_CTA
 # the FP32 L2-normalized key, one delta per value row of the tile, and the
 # scalar decay. Padded to a 16-float boundary so every field stays 16-byte
 # aligned. The block is addressed inside an otherwise unused speculative state
-# slot, which is why the record must never outgrow one value head of a slot.
+# slot, or under ``external_records`` inside one row of the bound records
+# buffer, which is why the record must never outgrow one value head of a slot.
 _RECORD_DELTA = _KEY_DIM
 _RECORD_DECAY = _KEY_DIM + _VALUE_ROWS_PER_CTA
 _RECORD_FLOATS = (_RECORD_DECAY + 1 + 15) // 16 * 16
@@ -52,6 +53,7 @@ _RECORD_FLOATS = (_RECORD_DECAY + 1 + 15) // 16 * 16
 # is checked against the bound tensor in ``_binding_key``, not asserted here
 # over compile-time constants.
 _RECORD_SLOT_FLOATS = _VALUE_TILES * _RECORD_FLOATS
+assert _RECORD_SLOT_FLOATS == RECORD_FLOATS_PER_VALUE_HEAD
 
 _KERNEL_CACHE: dict[tuple[object, ...], Callable[..., None]] = {}
 _WARMED: set[tuple[object, ...]] = set()
@@ -345,6 +347,7 @@ class _PackedRecurrentQwenKernel:
         null_state_index: int | None,
         state_type: type[cutlass.Numeric],
         deferred_checkpoints: bool = False,
+        external_records: bool = False,
     ) -> None:
         self.max_seqs = int(max_seqs)
         self.state_index_columns = int(state_index_columns)
@@ -354,6 +357,10 @@ class _PackedRecurrentQwenKernel:
         if self.head_ratio != 3:
             raise ValueError("CuTe Qwen GDN requires three value heads per key head")
         self.deferred_checkpoints = bool(deferred_checkpoints)
+        self.external_records = bool(external_records)
+        if self.external_records and not self.deferred_checkpoints:
+            raise ValueError("external GDN records require deferred checkpoints")
+        self.record_slot_stride = self.value_heads * _RECORD_SLOT_FLOATS
         if self.deferred_checkpoints:
             if state_type is not Float32:
                 raise ValueError(
@@ -397,6 +404,7 @@ class _PackedRecurrentQwenKernel:
         state_index_request_stride: Int64,
         state_index_column_stride: Int64,
         scale: Float32,
+        records: cute.Pointer | None,
         stream: cuda.CUstream,
     ):
         self.kernel(
@@ -419,6 +427,7 @@ class _PackedRecurrentQwenKernel:
             state_index_request_stride,
             state_index_column_stride,
             scale,
+            records,
         ).launch(
             grid=(self.work_ctas, 1, 1),
             block=(_THREADS, 1, 1),
@@ -445,6 +454,12 @@ class _PackedRecurrentQwenKernel:
                     + value_row.to(Int64)
                 )
                 output[output_offset] = BFloat16(0.0)
+
+    def _record_pool(self, recurrent_state, records, state_slot_stride):
+        """Where this plan's records live: the pool's spare slots or ``records``."""
+        if self.external_records:
+            return records, Int64(self.record_slot_stride)
+        return recurrent_state, state_slot_stride
 
     @cute.jit
     def _run_request(
@@ -473,12 +488,16 @@ class _PackedRecurrentQwenKernel:
         state_index_request_stride: Int64,
         state_index_column_stride: Int64,
         scale: Float32,
+        records: cute.Pointer | None,
     ):
         thread, _, _ = cute.arch.thread_idx()
         thread = Int32(thread)
         lane = Int32(cute.arch.lane_idx())
         key_lane = thread % Int32(_KEY_LANES_PER_ROW)
         row_leader = lane - key_lane
+        record_pool, record_slot_stride = self._record_pool(
+            recurrent_state, records, state_slot_stride
+        )
 
         # All pool-scaled products are widened before multiplication. A valid
         # recycled slot can place the first live state element past 2^31.
@@ -495,14 +514,14 @@ class _PackedRecurrentQwenKernel:
             )
         if cutlass.const_expr(self.deferred_checkpoints):
             _replay_deferred_records(
-                recurrent_state,
+                record_pool,
                 state_indices,
                 state,
                 request,
                 value_head,
                 value_row,
                 accepted_column,
-                state_slot_stride,
+                record_slot_stride,
                 state_index_request_stride,
                 state_index_column_stride,
                 self.state_index_columns,
@@ -654,7 +673,7 @@ class _PackedRecurrentQwenKernel:
                     self.deferred_checkpoints and relative_token > 0
                 ):
                     _store_deferred_record(
-                        recurrent_state,
+                        record_pool,
                         destination_index,
                         value_head,
                         value_row,
@@ -662,7 +681,7 @@ class _PackedRecurrentQwenKernel:
                         delta,
                         shared_k,
                         Int32(0),
-                        state_slot_stride,
+                        record_slot_stride,
                     )
                 elif cutlass.const_expr(self.has_null_state_index):
                     if destination_index != Int64(self.null_state_index):
@@ -720,12 +739,16 @@ class _PackedRecurrentQwenKernel:
         state_index_request_stride: Int64,
         state_index_column_stride: Int64,
         scale: Float32,
+        records: cute.Pointer | None,
     ):
         thread, _, _ = cute.arch.thread_idx()
         thread = Int32(thread)
         lane = Int32(cute.arch.lane_idx())
         key_lane = thread % Int32(_KEY_LANES_PER_ROW)
         row_leader = lane - key_lane
+        record_pool, record_slot_stride = self._record_pool(
+            recurrent_state, records, state_slot_stride
+        )
 
         allocator = cutlass.utils.SmemAllocator()
         shared_q = allocator.allocate_tensor(
@@ -874,14 +897,14 @@ class _PackedRecurrentQwenKernel:
                 )
             if cutlass.const_expr(self.deferred_checkpoints):
                 _replay_deferred_records(
-                    recurrent_state,
+                    record_pool,
                     state_indices,
                     state,
                     request,
                     value_head,
                     value_row,
                     accepted_column,
-                    state_slot_stride,
+                    record_slot_stride,
                     state_index_request_stride,
                     state_index_column_stride,
                     self.state_index_columns,
@@ -952,7 +975,7 @@ class _PackedRecurrentQwenKernel:
                         self.deferred_checkpoints and relative_token > 0
                     ):
                         _store_deferred_record(
-                            recurrent_state,
+                            record_pool,
                             destination_index,
                             value_head,
                             value_row,
@@ -960,7 +983,7 @@ class _PackedRecurrentQwenKernel:
                             delta,
                             shared_k,
                             shared_token_base,
-                            state_slot_stride,
+                            record_slot_stride,
                         )
                     elif cutlass.const_expr(self.has_null_state_index):
                         if destination_index != Int64(self.null_state_index):
@@ -1014,6 +1037,7 @@ class _PackedRecurrentQwenKernel:
         state_index_request_stride: Int64,
         state_index_column_stride: Int64,
         scale: Float32,
+        records: cute.Pointer | None,
     ):
         work_block, _, _ = cute.arch.block_idx()
         lane, _, _ = cute.arch.thread_idx()
@@ -1123,6 +1147,7 @@ class _PackedRecurrentQwenKernel:
                                     state_index_request_stride,
                                     state_index_column_stride,
                                     scale,
+                                    records,
                                 )
                             elif ungrouped_tail:
                                 self._run_request(
@@ -1150,6 +1175,7 @@ class _PackedRecurrentQwenKernel:
                                     state_index_request_stride,
                                     state_index_column_stride,
                                     scale,
+                                    records,
                                 )
                         else:
                             self._run_request(
@@ -1177,6 +1203,7 @@ class _PackedRecurrentQwenKernel:
                                 state_index_request_stride,
                                 state_index_column_stride,
                                 scale,
+                                records,
                             )
                 else:
                     if grouped_heads:
@@ -1205,6 +1232,7 @@ class _PackedRecurrentQwenKernel:
                                 state_index_request_stride,
                                 state_index_column_stride,
                                 scale,
+                                records,
                             )
                         elif ungrouped_tail:
                             self._run_request(
@@ -1232,6 +1260,7 @@ class _PackedRecurrentQwenKernel:
                                 state_index_request_stride,
                                 state_index_column_stride,
                                 scale,
+                                records,
                             )
                     else:
                         self._run_request(
@@ -1259,6 +1288,7 @@ class _PackedRecurrentQwenKernel:
                             state_index_request_stride,
                             state_index_column_stride,
                             scale,
+                            records,
                         )
 
 
@@ -1278,6 +1308,7 @@ class _CommitDeferredQwenKernel:
         state_index_columns: int,
         value_heads: int,
         state_type: type[cutlass.Numeric],
+        external_records: bool = False,
     ) -> None:
         self.max_seqs = int(max_seqs)
         self.state_index_columns = int(state_index_columns)
@@ -1287,6 +1318,8 @@ class _CommitDeferredQwenKernel:
                 "deferred GDN checkpoints require an FP32 recurrent state"
             )
         self.state_type = state_type
+        self.external_records = bool(external_records)
+        self.record_slot_stride = self.value_heads * _RECORD_SLOT_FLOATS
         self.work_ctas = min(
             _MAX_WORK_CTAS, self.max_seqs * self.value_heads * _VALUE_TILES
         )
@@ -1302,6 +1335,7 @@ class _CommitDeferredQwenKernel:
         state_slot_stride: Int64,
         state_index_request_stride: Int64,
         state_index_column_stride: Int64,
+        records: cute.Pointer | None,
         stream: cuda.CUstream,
     ):
         self.kernel(
@@ -1313,6 +1347,7 @@ class _CommitDeferredQwenKernel:
             state_slot_stride,
             state_index_request_stride,
             state_index_column_stride,
+            records,
         ).launch(
             grid=(self.work_ctas, 1, 1),
             block=(_THREADS, 1, 1),
@@ -1331,11 +1366,17 @@ class _CommitDeferredQwenKernel:
         state_slot_stride: Int64,
         state_index_request_stride: Int64,
         state_index_column_stride: Int64,
+        records: cute.Pointer | None,
     ):
         work_block, _, _ = cute.arch.block_idx()
         lane, _, _ = cute.arch.thread_idx()
         work_block = Int32(work_block)
         key_lane = Int32(lane) % Int32(_KEY_LANES_PER_ROW)
+        record_pool = recurrent_state
+        record_slot_stride = state_slot_stride
+        if cutlass.const_expr(self.external_records):
+            record_pool = records
+            record_slot_stride = Int64(self.record_slot_stride)
 
         live_seqs = num_seqs[Int32(0)].to(Int32)
         bounded_seqs = cutlass.max(
@@ -1363,18 +1404,20 @@ class _CommitDeferredQwenKernel:
             # others are still replaying out of, with no grid sync to order
             # them. The precondition forbids it; this refuses to commit rather
             # than race, so the failure is a stale state and not nondetermin-
-            # istic corruption.
+            # istic corruption. External records are another index space, so
+            # a pool destination cannot alias them and nothing is refused.
             commit_enabled = destination_index >= Int64(0)
-            for relative_token in cutlass.range_constexpr(
-                1, self.state_index_columns
-            ):
-                record_index = state_indices[
-                    request.to(Int64) * state_index_request_stride
-                    + Int64(relative_token) * state_index_column_stride
-                ].to(Int64)
-                commit_enabled = commit_enabled & (
-                    destination_index != record_index
-                )
+            if cutlass.const_expr(not self.external_records):
+                for relative_token in cutlass.range_constexpr(
+                    1, self.state_index_columns
+                ):
+                    record_index = state_indices[
+                        request.to(Int64) * state_index_request_stride
+                        + Int64(relative_token) * state_index_column_stride
+                    ].to(Int64)
+                    commit_enabled = commit_enabled & (
+                        destination_index != record_index
+                    )
             if commit_enabled:
                 source_index = state_indices[
                     request.to(Int64) * state_index_request_stride
@@ -1394,14 +1437,14 @@ class _CommitDeferredQwenKernel:
                         recurrent_state[state_base + key_column.to(Int64)]
                     )
                 _replay_deferred_records(
-                    recurrent_state,
+                    record_pool,
                     state_indices,
                     state,
                     request,
                     value_head,
                     value_row,
                     num_accepted_tokens[request].to(Int32) - Int32(1),
-                    state_slot_stride,
+                    record_slot_stride,
                     state_index_request_stride,
                     state_index_column_stride,
                     self.state_index_columns,
@@ -1432,7 +1475,23 @@ def _binding_key(binding: Binding) -> tuple[object, ...]:
         1,
     ):
         raise ValueError("recurrent state must be contiguous within each slot")
-    if caps.deferred_checkpoints:
+    external = getattr(caps, "external_records", False)
+    if external:
+        records = getattr(binding, "records", None)
+        width = caps.value_heads * _RECORD_SLOT_FLOATS
+        if (
+            records is None
+            or records.dtype != torch.float32
+            or len(records.shape) != 2
+            or int(records.shape[0]) < 1
+            or int(records.shape[1]) != width
+            or tuple(records.stride()) != (width, 1)
+        ):
+            raise ValueError(
+                "external_records requires a row-contiguous FP32 records "
+                f"buffer of shape [rows >= 1, {width}]"
+            )
+    elif caps.deferred_checkpoints:
         record_floats = caps.value_heads * _RECORD_SLOT_FLOATS
         if int(binding.recurrent_state.stride(0)) < record_floats:
             raise ValueError(
@@ -1457,6 +1516,8 @@ def _binding_key(binding: Binding) -> tuple[object, ...]:
     # the compiled-program identity it had before deferred checkpoints existed.
     if getattr(caps, "deferred_checkpoints", False):
         key += ("deferred_checkpoints",)
+    if external:
+        key += ("external_records",)
     return key
 
 
@@ -1480,7 +1541,9 @@ def _compile(binding: Binding) -> tuple[tuple[object, ...], Callable[..., None]]
         null_state_index=caps.null_state_index,
         state_type=state_type,
         deferred_checkpoints=getattr(caps, "deferred_checkpoints", False),
+        external_records=getattr(caps, "external_records", False),
     )
+    external = kernel.external_records
     raise_if_kernel_resolution_frozen(
         "cute.compile",
         target=kernel,
@@ -1516,6 +1579,7 @@ def _compile(binding: Binding) -> tuple[tuple[object, ...], Callable[..., None]]
         Int64(1),
         Int64(1),
         Float32(1.0),
+        fake_pointer(Float32) if external else None,
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "sequence.gdn_decode.packed_recurrent_qwen",
@@ -1535,8 +1599,13 @@ def _compile(binding: Binding) -> tuple[tuple[object, ...], Callable[..., None]]
     def launch(
         mixed_qkv, a, b, A_log, dt_bias, recurrent_state,
         query_start_loc, num_accepted_tokens, state_indices, num_seqs,
-        output, scale,
+        output, scale, records=None,
     ) -> None:
+        if (records is not None) != external:
+            raise ValueError(
+                "GDN records must be passed exactly when the plan has "
+                "external_records"
+            )
         raw(
             pointer(mixed_qkv, BFloat16),
             pointer(a, BFloat16),
@@ -1557,6 +1626,7 @@ def _compile(binding: Binding) -> tuple[tuple[object, ...], Callable[..., None]]
             int(state_indices.stride(0)),
             int(state_indices.stride(1)),
             float(scale),
+            pointer(records, Float32) if external else None,
             current_cuda_stream(),
         )
 
@@ -1604,6 +1674,7 @@ def run_packed_recurrent_qwen(
             binding.mixed_qkv, binding.a, binding.b, binding.A_log, binding.dt_bias,
             binding.recurrent_state, binding.query_start_loc, binding.num_accepted_tokens,
             binding.state_indices, binding.num_seqs, binding.output, scale_value,
+            binding.records,
         )
         if not capturing:
             _WARMED.add(key)
@@ -1615,7 +1686,7 @@ def _commit_key(binding: Binding) -> tuple[object, ...]:
         raise ValueError(
             "the deferred-checkpoint commit requires deferred_checkpoints caps"
         )
-    return (
+    key = (
         binding.output.device.index,
         caps.max_seqs,
         caps.state_index_columns,
@@ -1623,6 +1694,9 @@ def _commit_key(binding: Binding) -> tuple[object, ...]:
         binding.recurrent_state.dtype,
         binding.state_indices.dtype,
     )
+    if getattr(caps, "external_records", False):
+        key += ("external_records",)
+    return key
 
 
 def _compile_commit(
@@ -1641,7 +1715,9 @@ def _compile_commit(
         state_index_columns=caps.state_index_columns,
         value_heads=caps.value_heads,
         state_type=state_type,
+        external_records=getattr(caps, "external_records", False),
     )
+    external = kernel.external_records
     raise_if_kernel_resolution_frozen(
         "cute.compile", target=kernel, cache_key=key
     )
@@ -1655,6 +1731,7 @@ def _compile_commit(
         Int64(1),
         Int64(1),
         Int64(1),
+        _fake_pointer(Float32) if external else None,
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "sequence.gdn_decode.commit_deferred_qwen", 1, key
@@ -1663,8 +1740,13 @@ def _compile_commit(
 
     def launch(
         recurrent_state, num_accepted_tokens, state_indices,
-        destination_indices, num_seqs,
+        destination_indices, num_seqs, records=None,
     ) -> None:
+        if (records is not None) != external:
+            raise ValueError(
+                "GDN records must be passed exactly when the plan has "
+                "external_records"
+            )
         raw(
             _pointer(recurrent_state, state_type),
             _pointer(num_accepted_tokens, Int32),
@@ -1674,6 +1756,7 @@ def _compile_commit(
             int(recurrent_state.stride(0)),
             int(state_indices.stride(0)),
             int(state_indices.stride(1)),
+            _pointer(records, Float32) if external else None,
             current_cuda_stream(),
         )
 
@@ -1707,6 +1790,7 @@ def precompile_commit_deferred_checkpoints(binding: Binding) -> None:
                 device=binding.state_indices.device,
             ),
             binding.num_seqs,
+            binding.records,
         )
         _COMMIT_WARMED.add(key)
 
@@ -1721,7 +1805,8 @@ def run_commit_deferred_checkpoints(
     ``state_indices[request, 0]`` commits in place. It must **not** equal any of
     ``state_indices[request, 1:]`` -- those are the request's own record blocks,
     and the kernel refuses to commit such a request rather than race against
-    the CTAs still replaying out of it. The caller must treat the request's
+    the CTAs still replaying out of it. Under ``external_records`` those are
+    rows of the records buffer, not pool slots, and nothing is refused. The caller must treat the request's
     accepted-token count as one afterwards, exactly as vLLM already does after
     its own block-boundary state copy.
     """
@@ -1742,6 +1827,7 @@ def run_commit_deferred_checkpoints(
             binding.state_indices,
             destination_indices,
             binding.num_seqs,
+            binding.records,
         )
         if not capturing:
             _COMMIT_WARMED.add(key)

@@ -76,6 +76,7 @@ def _query_from_caps(caps, invocation):
         null_state_index=caps.null_state_index, **dict(invocation),
         recover_speculative_state=caps.recover_speculative_state,
         deferred_checkpoints=caps.deferred_checkpoints,
+        external_records=caps.external_records,
     )
 
 
@@ -89,6 +90,7 @@ def _caps(query, ordinal):
         qk_l2norm=query.qk_l2norm, null_state_index=query.null_state_index,
         recover_speculative_state=query.recover_speculative_state,
         deferred_checkpoints=query.deferred_checkpoints,
+        external_records=query.external_records,
     )
 
 
@@ -148,6 +150,10 @@ def _metadata_binding(query, layout):
         data.update(a=tensor("a", (m, h)), b=tensor("b", (m, h)))
         cls = Binding
     scratch = _TensorMetadata(torch.uint8, (1,), (1,), caps.device, 16)
+    if caps.external_records:
+        data.update(records=_TensorMetadata(
+            torch.float32, (1, caps.record_width), (caps.record_width, 1), caps.device, 16,
+        ))
     return cls(_state=layout, scratch=scratch, **data)
 
 
@@ -301,13 +307,16 @@ class _GdnState:
             if apply_output_norm:
                 self._run_norm(binding.output, binding.z, binding.norm_weight, binding.num_tokens, eps)
             return binding.output
-        self.run_tensors(*_binding_tensors(binding), eps=eps, scale=scale, lower_bound=float(lower_bound))
+        self.run_tensors(
+            *_binding_tensors(binding), eps=eps, scale=scale, lower_bound=float(lower_bound),
+            records=getattr(binding, "records", None),
+        )
         return binding.output
 
     def run_tensors(
         self, mixed_qkv, a, b, z, A_log, dt_bias, norm_weight, recurrent_state,
         query_start_loc, num_accepted_tokens, state_indices, num_seqs, num_tokens,
-        output, *, eps, scale, lower_bound,
+        output, *, eps, scale, lower_bound, records=None,
     ):
         if self.query.recover_speculative_state:
             raise ValueError("KDA recovery requires a binding with record buffers")
@@ -331,6 +340,7 @@ class _GdnState:
             self.recurrent(
                 mixed_qkv, a, b, A_log, dt_bias, recurrent_state, query_start_loc,
                 num_accepted_tokens, state_indices, num_seqs, output, float(scale),
+                records,
             )
         self._run_norm(output, z, norm_weight, num_tokens, eps)
 

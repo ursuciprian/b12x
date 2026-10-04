@@ -3723,18 +3723,23 @@ def _packed_layer_views(
     return backing, views, page, block
 
 
+@pytest.mark.parametrize("mode", ["decode", "prefill"])
 @pytest.mark.parametrize("kv_dtype", [torch.float8_e4m3fn, torch.bfloat16])
-def test_qsa_small_packed_pages_match_one_large_page(kv_dtype: torch.dtype) -> None:
+def test_qsa_small_packed_pages_match_one_large_page(
+    kv_dtype: torch.dtype, mode: str,
+) -> None:
     """VLLM_HYBRID_ATTN_BLOCK_SIZE (vLLM exp/r17-attn-block): the 13 QSA layers
     of Qwen3.8-Flash-Next share one 3,290,112-byte pool block as 232-token pages
     instead of one 3024-token page per block and layer. The same requests must
     give the same output, selection and selector state, bit for bit, and the
-    run must not write outside its own layer page."""
+    run must not write outside its own layer page. ``prefill``: request 0 is a
+    465-row chunk from a group boundary with an empty raw ring, so the kernel
+    writes 117 compressed rows across three 58-row pages; request 1 decodes."""
     device = require_sm120()
     lengths = (5005, 3033)  # cross 3024 and many 232-token pages
-    rows_per_request = 5  # verified token + 4 drafts
+    rows_per_request = (465 if mode == "prefill" else 5, 5)  # decode: 1 + 4 drafts
     common = dict(
-        max_batch=2, max_raw_state_slots=2, max_q_rows=10, max_seq_len=8192,
+        max_batch=2, max_raw_state_slots=2, max_q_rows=480, max_seq_len=8192,
         q_heads=24, kv_heads=2, head_dim=256, index_heads=4, index_head_dim=128,
         index_rotary_dim=64, max_speculative_tokens=4, kv_dtype=kv_dtype,
     )
@@ -3757,6 +3762,11 @@ def test_qsa_small_packed_pages_match_one_large_page(kv_dtype: torch.dtype) -> N
         plan=qsa.plan(small_caps, invocation=_invocation(small_caps, **descriptors)),
         tensors=packed,
     )
+    for cache in (reference.main_k_cache, reference.main_v_cache):
+        cache.view(torch.int16 if cache.element_size() == 2 else torch.uint8).fill_(
+            0x5A5A if cache.element_size() == 2 else 0x5A
+        )
+    reference.compressed_k_cache.view(torch.int16).fill_(0x5A5A)  # same bytes as packed
     for binding in (reference, small):
         binding.index_q_norm_weight.fill_(1)
         binding.index_k_norm_weight.fill_(1)
@@ -3799,6 +3809,8 @@ def test_qsa_small_packed_pages_match_one_large_page(kv_dtype: torch.dtype) -> N
         c = torch.randn(
             (groups.numel(), 128), generator=generator, dtype=torch.float32,
         ).to(device=device, dtype=torch.bfloat16)
+        # rows the kernel writes this step start zeroed in both geometries
+        c[(length - rows_per_request[request]) // 4:] = 0
         for name, binding, page_size in (
             ("ref", reference, 3024), ("small", small, 232),
         ):
@@ -3809,13 +3821,13 @@ def test_qsa_small_packed_pages_match_one_large_page(kv_dtype: torch.dtype) -> N
     before = backing.clone()
 
     positions = tuple(
-        length - rows_per_request + i
-        for length in lengths for i in range(rows_per_request)
+        length - rows + i
+        for length, rows in zip(lengths, rows_per_request) for i in range(rows)
     )
-    requests = tuple(r for r in range(2) for _ in range(rows_per_request))
+    requests = tuple(r for r in range(2) for _ in range(rows_per_request[r]))
     dynamic = _dynamic_inputs(
         reference, positions=positions, request_ids=requests,
-        accepted_tokens=(1, 1), is_prefilling=(False, False),
+        accepted_tokens=(1, 1), is_prefilling=(mode == "prefill", False),
     )
     small.raw_interval_start_positions.copy_(reference.raw_interval_start_positions)
     for name in ("raw_logical_positions", "raw_rope_positions"):

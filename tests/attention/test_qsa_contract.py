@@ -106,6 +106,7 @@ def _allocate_binding(
     caps: qsa.Caps,
     *,
     plan: qsa.Plan | None = None,
+    tensors: dict[str, torch.Tensor] | None = None,
 ) -> qsa.Binding:
     declaration = qsa.plan(caps, invocation=_invocation(caps)) if plan is None else plan
     device = caps.device
@@ -207,6 +208,7 @@ def _allocate_binding(
         rope_cos=rope_cos, rope_sin=rope_sin, output=output,
         selected_positions=selected,
     )
+    binding_kwargs.update(tensors or {})
     prepared: dict[str, object] = {}
 
     def prepare_call(state: object) -> PreparedCall:
@@ -3680,3 +3682,178 @@ def test_qsa_draft_reuse_validates_live_input_contract_before_mutation():
     with pytest.raises(ValueError, match="overlap"):
         qsa.run(binding, **common, reuse=qsa.DraftSelectionReuse(aliased_rows))
     assert state.num_source_rows.item() == 0
+
+
+def _packed_layer_views(
+    caps: qsa.Caps, *, layers: int, layer: int, pad_bytes: int,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor], int, int]:
+    """vLLM's block-outermost hybrid pool: ``layers`` QSA pages side by side in
+    each pool block (main K, main V, compressed tail), then ``pad_bytes``."""
+    kv_bytes = caps.kv_dtype.itemsize
+    plane = caps.main_page_size * caps.kv_heads * caps.head_dim * kv_bytes
+    page = 2 * plane + caps.compressed_page_size * caps.index_head_dim * 2
+    block = layers * page + pad_bytes
+    backing = torch.full(
+        (caps.num_main_cache_pages * block,), 0x5A, dtype=torch.uint8,
+        device=caps.device,
+    )
+    main_shape = (
+        caps.num_main_cache_pages, caps.main_page_size, caps.kv_heads, caps.head_dim,
+    )
+    main_strides = (block // kv_bytes, caps.kv_heads * caps.head_dim, caps.head_dim, 1)
+    kv = backing.view(caps.kv_dtype)
+    views = {
+        "main_k_cache": kv.as_strided(
+            main_shape, main_strides, storage_offset=layer * page // kv_bytes,
+        ),
+        "main_v_cache": kv.as_strided(
+            main_shape, main_strides,
+            storage_offset=(layer * page + plane) // kv_bytes,
+        ),
+        "compressed_k_cache": backing.view(torch.bfloat16).as_strided(
+            (
+                caps.num_compressed_cache_pages,
+                caps.compressed_page_size,
+                caps.index_head_dim,
+            ),
+            (block // 2, caps.index_head_dim, 1),
+            storage_offset=(layer * page + 2 * plane) // 2,
+        ),
+    }
+    return backing, views, page, block
+
+
+@pytest.mark.parametrize("kv_dtype", [torch.float8_e4m3fn, torch.bfloat16])
+def test_qsa_small_packed_pages_match_one_large_page(kv_dtype: torch.dtype) -> None:
+    """VLLM_HYBRID_ATTN_BLOCK_SIZE (vLLM exp/r17-attn-block): the 13 QSA layers
+    of Qwen3.8-Flash-Next share one 3,290,112-byte pool block as 232-token pages
+    instead of one 3024-token page per block and layer. The same requests must
+    give the same output, selection and selector state, bit for bit, and the
+    run must not write outside its own layer page."""
+    device = require_sm120()
+    lengths = (5005, 3033)  # cross 3024 and many 232-token pages
+    rows_per_request = 5  # verified token + 4 drafts
+    common = dict(
+        max_batch=2, max_raw_state_slots=2, max_q_rows=10, max_seq_len=8192,
+        q_heads=24, kv_heads=2, head_dim=256, index_heads=4, index_head_dim=128,
+        index_rotary_dim=64, max_speculative_tokens=4, kv_dtype=kv_dtype,
+    )
+    ref_caps = _caps(
+        device, main_page_size=3024, compressed_page_size=756,
+        num_main_cache_pages=8, num_compressed_cache_pages=8, **common,
+    )
+    small_caps = _caps(
+        device, main_page_size=232, compressed_page_size=58,
+        num_main_cache_pages=48, num_compressed_cache_pages=48, **common,
+    )
+    layer = 12  # the last layer page of the block, next to the padding
+    backing, packed, page, block = _packed_layer_views(
+        small_caps, layers=13, layer=layer, pad_bytes=8704,
+    )
+    descriptors = {name: qsa_contract._descriptor(t) for name, t in packed.items()}
+    reference = _allocate_binding(ref_caps)
+    small = _allocate_binding(
+        small_caps,
+        plan=qsa.plan(small_caps, invocation=_invocation(small_caps, **descriptors)),
+        tensors=packed,
+    )
+    for binding in (reference, small):
+        binding.index_q_norm_weight.fill_(1)
+        binding.index_k_norm_weight.fill_(1)
+        binding.raw_k_ring.zero_()
+
+    generator = torch.Generator(device="cpu").manual_seed(80)
+    order = torch.randperm(48, generator=generator).tolist()
+    tables = {}
+    for name, binding, page_size in (
+        ("ref", reference, 3024), ("small", small, 232),
+    ):
+        ids, cursor = [], 0
+        for request, length in enumerate(lengths):
+            count = -(-length // page_size)
+            pages = (
+                order[cursor:cursor + count] if name == "small"
+                else list(range(3 * request, 3 * request + count))
+            )
+            cursor += count
+            binding.main_block_table[request, :count] = torch.tensor(pages)
+            binding.compressed_block_table[request, :count] = torch.tensor(pages)
+            ids.append(pages)
+        tables[name] = ids
+
+    def put(cache, pages, page_size, index, values):
+        # index_put on integer views: no float8 index_put kernel needed.
+        raw = torch.int16 if cache.element_size() == 2 else torch.uint8
+        page_ids = torch.tensor(pages, device=device)[index // page_size]
+        cache.view(raw)[page_ids, index % page_size] = values.view(raw)
+
+    for request, length in enumerate(lengths):
+        positions = torch.arange(length, device=device)
+        groups = torch.arange(-(-length // 4), device=device)
+        k = torch.randn(
+            (length, 2, 256), generator=generator, dtype=torch.float32,
+        ).to(device=device, dtype=kv_dtype)
+        v = torch.randn(
+            (length, 2, 256), generator=generator, dtype=torch.float32,
+        ).to(device=device, dtype=kv_dtype)
+        c = torch.randn(
+            (groups.numel(), 128), generator=generator, dtype=torch.float32,
+        ).to(device=device, dtype=torch.bfloat16)
+        for name, binding, page_size in (
+            ("ref", reference, 3024), ("small", small, 232),
+        ):
+            pages = tables[name][request]
+            put(binding.main_k_cache, pages, page_size, positions, k)
+            put(binding.main_v_cache, pages, page_size, positions, v)
+            put(binding.compressed_k_cache, pages, page_size // 4, groups, c)
+    before = backing.clone()
+
+    positions = tuple(
+        length - rows_per_request + i
+        for length in lengths for i in range(rows_per_request)
+    )
+    requests = tuple(r for r in range(2) for _ in range(rows_per_request))
+    dynamic = _dynamic_inputs(
+        reference, positions=positions, request_ids=requests,
+        accepted_tokens=(1, 1), is_prefilling=(False, False),
+    )
+    small.raw_interval_start_positions.copy_(reference.raw_interval_start_positions)
+    for name in ("raw_logical_positions", "raw_rope_positions"):
+        getattr(small, name).copy_(getattr(reference, name))
+    qsa.run(reference, **dynamic)
+    qsa.run(small, **dynamic)
+    torch.cuda.synchronize(device)
+
+    rows = len(positions)
+    torch.testing.assert_close(
+        small.output[:rows], reference.output[:rows], rtol=0, atol=0,
+    )
+    assert torch.equal(
+        small.selected_positions[:rows], reference.selected_positions[:rows]
+    )
+    for name in (
+        "raw_k_ring", "raw_logical_positions", "raw_rope_positions",
+        "raw_interval_start_positions",
+    ):
+        torch.testing.assert_close(
+            getattr(small, name), getattr(reference, name), rtol=0, atol=0,
+        )
+    for request, length in enumerate(lengths):
+        groups = torch.arange(-(-length // 4), device=device)
+
+        def rows_of(binding, name, page_size):
+            page_ids = torch.tensor(tables[name][request], device=device)
+            return binding.compressed_k_cache[
+                page_ids[groups // page_size], groups % page_size
+            ]
+
+        torch.testing.assert_close(
+            rows_of(small, "small", 58), rows_of(reference, "ref", 756),
+            rtol=0, atol=0,
+        )
+    # Bytes of the other 12 layer pages and the block padding are untouched.
+    outside = torch.ones(block, dtype=torch.bool, device=device)
+    outside[layer * page:(layer + 1) * page] = False
+    outside = outside.repeat(small_caps.num_main_cache_pages)
+    assert torch.equal(backing[outside], before[outside])
+

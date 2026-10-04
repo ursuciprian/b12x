@@ -29,8 +29,15 @@ def _prepared_case_lifetime():
 def _prepare(caps, tensors, *, restore_state=None):
     original_output = tensors["output"].clone()
     if restore_state is None:
-        original_state = tensors["recurrent_state"].clone()
-        restore_state = lambda: tensors["recurrent_state"].copy_(original_state)
+        original = {
+            name: tensors[name].clone()
+            for name in ("recurrent_state", "records")
+            if name in tensors
+        }
+
+        def restore_state():
+            for name, value in original.items():
+                tensors[name].copy_(value)
     declaration = gdn.plan(caps, invocation=gdn.invocation_from_tensors(caps, **tensors))
 
     def restore():
@@ -86,6 +93,7 @@ def _make_case(
     norm_dtype: torch.dtype = torch.bfloat16,
     qk_l2norm: bool = True,
     deferred_checkpoints: bool = False,
+    external_records: bool = False,
 ) -> tuple[gdn.Binding, dict[str, torch.Tensor]]:
     live_seqs = len(query_lengths)
     columns = 4 if columns is None else columns
@@ -107,6 +115,7 @@ def _make_case(
         gate_activation=activation,
         qk_l2norm=qk_l2norm,
         deferred_checkpoints=deferred_checkpoints,
+        external_records=external_records,
     )
     query_start_loc = torch.full(
         (max_seqs + 1,), live_tokens, dtype=torch.int32, device=device
@@ -155,6 +164,21 @@ def _make_case(
             device=device,
         ),
     }
+    if external_records:
+        # Row 0 is a sink and request r owns rows 1 + r * (columns - 1) + j - 1,
+        # the vLLM layout. Column 0 keeps its pool slot. NaN catches a replay
+        # of a record nobody wrote.
+        spec_columns = columns - 1
+        record_ids = 1 + torch.arange(
+            max_seqs * spec_columns, dtype=torch.int32, device=device
+        ).view(max_seqs, spec_columns)
+        state_indices[:, 1:].copy_(record_ids)
+        tensors["records"] = torch.full(
+            (1 + max_seqs * spec_columns, caps.record_width),
+            float("nan"),
+            dtype=torch.float32,
+            device=device,
+        )
     binding = _prepare(caps, tensors)
     return binding, tensors
 

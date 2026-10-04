@@ -669,3 +669,330 @@ def test_replay_and_commit_address_slots_beyond_two_to_the_31() -> None:
     torch.cuda.synchronize(device)
     assert torch.equal(large, compact)
     assert bool(compact[10].abs().max() > 0)
+
+
+# --------------------------------------------------------------------------
+# External records (Caps.external_records): the same records in a caller-owned
+# buffer indexed by state_indices[r, 1:] instead of spare pool slots. Contract
+# on CPU; on SM120 every comparison is in-pool kernel against external kernel
+# at rtol=0, atol=0.
+# --------------------------------------------------------------------------
+
+
+def test_external_records_stay_out_of_the_selection_key_and_off_payload() -> None:
+    off = _query(deferred_checkpoints=True)
+    on = _query(deferred_checkpoints=True, external_records=True)
+    assert "external_records" not in TUNING.query_fields
+    assert TUNING.encode_query(off) == TUNING.encode_query(on)
+    # Off, the compile-job payload is byte-for-byte what it was before.
+    assert "external_records" not in off.to_dict()
+    assert GdnQuery(**on.to_dict()).external_records is True
+    TUNING.validate_query(on, None)
+    with pytest.raises(ValueError, match="require deferred"):
+        TUNING.validate_query(_query(external_records=True), None)
+
+
+def test_caps_require_deferred_checkpoints_for_external_records() -> None:
+    base = dict(
+        device=torch.device("cuda", 0),
+        max_tokens=80,
+        max_seqs=16,
+        max_state_slots=128,
+        key_heads=8,
+        value_heads=24,
+        state_index_columns=5,
+        gate_activation="sigmoid",
+        deferred_checkpoints=True,
+    )
+    caps = Caps(**base, external_records=True)
+    assert caps.record_width == 24 * 4 * 176
+    with pytest.raises(ValueError, match="requires deferred_checkpoints"):
+        Caps(**{**base, "deferred_checkpoints": False}, external_records=True)
+    with pytest.raises(TypeError, match="must be boolean"):
+        Caps(**base, external_records=1)
+
+
+def test_off_compiled_program_keys_are_unchanged() -> None:
+    pytest.importorskip("cutlass")
+    from b12x.sequence.gdn_decode import _cute_kernels, _preparation
+    from b12x.sequence.gdn_decode._impl import _scratch_layout
+    from b12x.sequence.gdn_decode._tuning import GdnConfig
+
+    def keys(query):
+        caps = _preparation._caps(query, 0)
+        layout = _scratch_layout(
+            caps, config=GdnConfig(backend="cutedsl", recurrent_block_v=32)
+        )
+        binding = _preparation._metadata_binding(query, layout)
+        commit = _cute_kernels._commit_key(binding) if caps.deferred_checkpoints else None
+        return _cute_kernels._binding_key(binding), commit
+
+    # The exact tuples the shipped deferred build produced.
+    legacy = (0, 16, 5, 8, 24, True, None, torch.float32, torch.int32,
+              torch.float32, torch.bfloat16)
+    off, off_commit = keys(_query(deferred_checkpoints=True))
+    assert off == legacy + ("deferred_checkpoints",)
+    assert off_commit == (0, 16, 5, 24, torch.float32, torch.int32)
+    on, on_commit = keys(_query(deferred_checkpoints=True, external_records=True))
+    assert on == off + ("external_records",)
+    assert on_commit == off_commit + ("external_records",)
+
+
+def _external_pair(device, query_lengths, *, max_seqs=None):
+    """In-pool deferred plan and external-records plan over identical inputs."""
+    live_seqs = len(query_lengths)
+    max_seqs = live_seqs if max_seqs is None else max_seqs
+    shape = dict(
+        device=device,
+        query_lengths=query_lengths,
+        max_seqs=max_seqs,
+        max_tokens=sum(query_lengths),
+        columns=5,
+        # One spare slot per request past every window, for export commits.
+        state_slots=max_seqs * 5 + 1 + live_seqs,
+        activation="sigmoid",
+        state_dtype=torch.float32,
+        a_log_dtype=torch.float32,
+        deferred_checkpoints=True,
+    )
+    pool_binding, pool = _make_case(**shape)
+    ext_binding, ext = _make_case(**shape, external_records=True)
+    for name in _INPUTS:
+        pool[name].copy_(ext[name])
+    for name in ("query_start_loc", "num_seqs", "num_tokens"):
+        assert torch.equal(pool[name], ext[name])
+    assert torch.equal(pool["state_indices"][:, 0], ext["state_indices"][:, 0])
+    return pool_binding, pool, ext_binding, ext
+
+
+def _assert_same_step(pool, ext, query_lengths) -> None:
+    tokens = sum(query_lengths)
+    torch.testing.assert_close(
+        ext["output"][:tokens], pool["output"][:tokens], rtol=0, atol=0
+    )
+    width = ext["records"].shape[1]
+    slots = pool["recurrent_state"].shape[0]
+    pool_flat = pool["recurrent_state"].view(slots, -1)
+    pool_indices = pool["state_indices"].tolist()
+    ext_indices = ext["state_indices"].tolist()
+    for request, length in enumerate(query_lengths):
+        base = pool_indices[request][0]
+        torch.testing.assert_close(
+            ext["recurrent_state"][base],
+            pool["recurrent_state"][base],
+            rtol=0,
+            atol=0,
+        )
+        # The record blocks themselves, byte for byte, in their new home.
+        for column in range(1, length):
+            torch.testing.assert_close(
+                ext["records"][ext_indices[request][column]],
+                pool_flat[pool_indices[request][column], :width],
+                rtol=0,
+                atol=0,
+            )
+
+
+@pytest.mark.parametrize("live_seqs", (1, 8, 16))
+def test_external_records_are_the_in_pool_records(live_seqs) -> None:
+    device = require_sm120()
+    lengths = (5,) * live_seqs
+    pool_binding, pool, ext_binding, ext = _external_pair(device, lengths)
+    gdn.run(pool_binding)
+    gdn.run(ext_binding)
+    torch.cuda.synchronize(device)
+    _assert_same_step(pool, ext, lengths)
+
+
+@pytest.mark.parametrize(
+    "query_lengths", ((5,) * 8, (1, 5, 3, 2, 5, 4, 1, 5))
+)
+def test_external_replay_commit_and_export_match_in_pool(query_lengths) -> None:
+    """Fused replay, in-place commit and export commit, accepted 1..length."""
+    device = require_sm120()
+    live = len(query_lengths)
+    pool_binding, pool, ext_binding, ext = _external_pair(device, query_lengths)
+    gdn.run(pool_binding)
+    gdn.run(ext_binding)
+    torch.cuda.synchronize(device)
+    _assert_same_step(pool, ext, query_lengths)
+    pool_primed = pool["recurrent_state"].clone()
+    ext_primed = ext["recurrent_state"].clone()
+    ext_records = ext["records"].clone()
+    for name in ("mixed_qkv", "a", "b", "z"):
+        ext[name].normal_(0.0, 0.25)
+        pool[name].copy_(ext[name])
+    base = pool["state_indices"][:, 0].clone().contiguous()
+    # A spare pool slot per request, outside every window, for the export.
+    spare = int(pool["state_indices"].max()) + 1
+    assert pool["recurrent_state"].shape[0] > spare + live - 1
+    export = torch.arange(spare, spare + live, dtype=torch.int32, device=device)
+
+    for shift in range(5):
+        accepted = torch.tensor(
+            [1 + (shift + row) % length for row, length in enumerate(query_lengths)],
+            dtype=torch.int32,
+            device=device,
+        )
+        for side, primed in ((pool, pool_primed), (ext, ext_primed)):
+            side["recurrent_state"].copy_(primed)
+            side["num_accepted_tokens"][:live].copy_(accepted)
+        ext["records"].copy_(ext_records)
+
+        # Export commit: writes only the destination, window untouched.
+        gdn.commit_deferred_checkpoints(pool_binding, export)
+        gdn.commit_deferred_checkpoints(ext_binding, export)
+        torch.cuda.synchronize(device)
+        torch.testing.assert_close(
+            ext["recurrent_state"][spare : spare + live],
+            pool["recurrent_state"][spare : spare + live],
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(ext["records"], ext_records, rtol=0, atol=0, equal_nan=True)
+
+        # Fused replay in the next decode step.
+        expected = gdn.run(pool_binding).clone()
+        actual = gdn.run(ext_binding)
+        torch.cuda.synchronize(device)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        for row in range(live):
+            slot = int(base[row])
+            torch.testing.assert_close(
+                ext["recurrent_state"][slot],
+                pool["recurrent_state"][slot],
+                rtol=0,
+                atol=0,
+            )
+
+        # In-place commit from the primed window.
+        for side, primed in ((pool, pool_primed), (ext, ext_primed)):
+            side["recurrent_state"].copy_(primed)
+        ext["records"].copy_(ext_records)
+        gdn.commit_deferred_checkpoints(pool_binding, base)
+        gdn.commit_deferred_checkpoints(ext_binding, base)
+        torch.cuda.synchronize(device)
+        torch.testing.assert_close(
+            ext["recurrent_state"], pool["recurrent_state"], rtol=0, atol=0
+        )
+
+
+def test_external_commit_into_a_block_id_equal_to_a_record_id() -> None:
+    """Record ids and pool block ids are different number spaces now.
+
+    Each request commits into the pool slot whose number equals its own first
+    record id. The in-pool path would refuse that (it is the request's record
+    block there); the external path must commit it.
+    """
+    device = require_sm120()
+    lengths = (5,) * 4
+    pool_binding, pool, ext_binding, ext = _external_pair(device, lengths)
+    gdn.run(pool_binding)
+    gdn.run(ext_binding)
+    torch.cuda.synchronize(device)
+    for side in (pool, ext):
+        side["num_accepted_tokens"][:4] = 4
+    destination = ext["state_indices"][:, 1].clone().contiguous()
+    bases = ext["state_indices"][:, 0].tolist()
+    # No destination may be another live request's base (that would race).
+    for row, slot in enumerate(destination.tolist()):
+        assert slot not in bases or bases[row] == slot
+    gdn.commit_deferred_checkpoints(
+        pool_binding, pool["state_indices"][:, 0].clone().contiguous()
+    )
+    gdn.commit_deferred_checkpoints(ext_binding, destination)
+    torch.cuda.synchronize(device)
+    for row, slot in enumerate(destination.tolist()):
+        torch.testing.assert_close(
+            ext["recurrent_state"][slot],
+            pool["recurrent_state"][bases[row]],
+            rtol=0,
+            atol=0,
+        )
+        assert bool(ext["recurrent_state"][slot].abs().max() > 0)
+
+
+def test_external_graph_replays_follow_request_slots_not_batch_rows() -> None:
+    """Rows reorder between replays; each request's records move with it."""
+    import gc
+    import random
+
+    from b12x._lib.runtime_control import kernel_resolution_guard
+
+    device = require_sm120()
+    requests, columns = 8, 5
+    pool_binding, pool, ext_binding, ext = _external_pair(
+        device, (columns,) * requests
+    )
+    windows = {id(t): t["state_indices"].clone() for t in (pool, ext)}
+    both = (pool, ext)
+
+    def set_step(order, lengths, accepted) -> None:
+        starts = [0]
+        for length in lengths:
+            starts.append(starts[-1] + length)
+        for t in both:
+            t["num_seqs"].fill_(len(order))
+            t["num_tokens"].fill_(starts[-1])
+            t["query_start_loc"].fill_(starts[-1])
+            t["query_start_loc"][: len(order) + 1].copy_(
+                torch.tensor(starts, dtype=torch.int32, device=device)
+            )
+            t["num_accepted_tokens"].fill_(1)
+            t["state_indices"].copy_(windows[id(t)])
+            if order:
+                t["num_accepted_tokens"][: len(order)].copy_(
+                    torch.tensor(accepted, dtype=torch.int32, device=device)
+                )
+                t["state_indices"][: len(order)].copy_(windows[id(t)][list(order)])
+        for name in ("mixed_qkv", "a", "b", "z"):
+            ext[name].normal_(0.0, 0.25)
+            pool[name].copy_(ext[name])
+
+    stream = torch.cuda.Stream(device)
+    stream.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(stream):
+        set_step(range(requests), (columns,) * requests, (1,) * requests)
+        gdn.run(pool_binding)
+        gdn.run(ext_binding)
+    torch.cuda.synchronize(device)
+    verified = [columns] * requests
+    graphs = []
+    gc.collect()
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        with kernel_resolution_guard("external GDN records capture"):
+            for binding in (pool_binding, ext_binding):
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, stream=stream):
+                    gdn.run(binding)
+                graphs.append(graph)
+    finally:
+        if gc_was_enabled:
+            gc.enable()
+
+    rng = random.Random(20261004)
+    with kernel_resolution_guard("external GDN records replay"):
+        for live in (8, 3, 8, 1, 6, 8):
+            order = rng.sample(range(requests), live)
+            lengths = [rng.randint(1, columns) for _ in order]
+            accepted = [rng.randint(1, verified[r]) for r in order]
+            set_step(order, lengths, accepted)
+            for graph in graphs:
+                graph.replay()
+            torch.cuda.synchronize(device)
+            tokens = sum(lengths)
+            torch.testing.assert_close(
+                ext["output"][:tokens], pool["output"][:tokens], rtol=0, atol=0
+            )
+            for request in order:
+                base = int(windows[id(pool)][request, 0])
+                torch.testing.assert_close(
+                    ext["recurrent_state"][base],
+                    pool["recurrent_state"][base],
+                    rtol=0,
+                    atol=0,
+                )
+            for request, length in zip(order, lengths):
+                verified[request] = length

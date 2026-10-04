@@ -21,6 +21,10 @@ from ._tuning import GdnConfig
 
 GateActivation = Literal["silu", "sigmoid"]
 
+# One deferred record block per (value head, 32-row value tile): 128 key floats,
+# 32 deltas and a decay, padded to 176 floats. Mirrored by _cute_kernels.
+RECORD_FLOATS_PER_VALUE_HEAD = 4 * 176
+
 
 def _canonical_device(device: torch.device | str) -> torch.device:
     result = torch.device(device)
@@ -57,6 +61,10 @@ class Caps:
     # Off by default: the shipped recipe keeps writing one full checkpoint per
     # verified token. See docs/gdn-deferred-checkpoints.md.
     deferred_checkpoints: bool = False
+    # Off by default: deferred records live in the speculative pool slots. On,
+    # they live in a caller-owned ``records`` buffer bound per layer, indexed
+    # by ``state_indices[r, 1:]``, so the pool needs no speculative slots.
+    external_records: bool = False
 
     def __post_init__(self) -> None:
         device = _canonical_device(self.device)
@@ -130,10 +138,19 @@ class Caps:
                 raise ValueError(
                     "deferred checkpoints require null_state_index=None"
                 )
+        if type(self.external_records) is not bool:
+            raise TypeError("external_records must be boolean")
+        if self.external_records and not self.deferred_checkpoints:
+            raise ValueError("external_records requires deferred_checkpoints")
 
     @property
     def value_heads_per_key_head(self) -> int:
         return self.value_heads // self.key_heads
+
+    @property
+    def record_width(self) -> int:
+        """FP32 elements per record row of an ``external_records`` buffer."""
+        return self.value_heads * RECORD_FLOATS_PER_VALUE_HEAD
 
     @property
     def packed_qkv_width(self) -> int:
@@ -200,6 +217,7 @@ class Binding:
     num_tokens: torch.Tensor
     output: torch.Tensor
     plan: Plan | None = None
+    records: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -376,6 +394,7 @@ def _bind(
     num_seqs: torch.Tensor,
     num_tokens: torch.Tensor,
     output: torch.Tensor,
+    records: torch.Tensor | None = None,
 ) -> Binding:
     """Bind Qwen GDN tensors without allocating runtime storage.
 
@@ -391,10 +410,31 @@ def _bind(
     tensors; their innermost dimensions must remain contiguous and rows must
     not overlap. All live tensors for one invocation must be bound together
     before :func:`run`.
+
+    Under ``Caps.external_records`` ``records`` is required: a row-contiguous
+    FP32 ``[rows, caps.record_width]`` buffer whose row ``i`` is the record
+    block that ``state_indices[r, j] == i`` (``j >= 1``) names. Otherwise it
+    must be omitted.
     """
     if not isinstance(plan, _GdnLayout):
         raise TypeError("GDN binding requires its materialized scratch layout")
     caps = plan.caps
+    if caps.external_records != (records is not None):
+        raise ValueError(
+            "records must be bound exactly when Caps.external_records is set"
+        )
+    if records is not None:
+        if records.ndim != 2:
+            raise ValueError(
+                f"records must have two dimensions, got {tuple(records.shape)}"
+            )
+        _require_tensor(
+            "records",
+            records,
+            shape=(_positive("records rows", records.shape[0]), caps.record_width),
+            device=caps.device,
+            dtypes=(torch.float32,),
+        )
     scratch_storage = scratch_tensor(scratch, plan.scratch_specs(), owner="GDN decode")
     model = (caps.model_dtype,)
     parameter = (torch.bfloat16, torch.float32)
@@ -524,6 +564,8 @@ def _bind(
         ("recurrent_state", recurrent_state),
         ("output", output),
     )
+    if records is not None:
+        mutable += (("records", records),)
     read_only = (
         ("mixed_qkv", mixed_qkv),
         ("a", a),
@@ -568,6 +610,7 @@ def _bind(
         num_seqs=num_seqs,
         num_tokens=num_tokens,
         output=output,
+        records=records,
     )
 
 
@@ -860,6 +903,7 @@ def run(
         scale=scale_value,
         lower_bound=0.0,
         plan=binding.plan,
+        records=binding.records,
     )
     return binding.output
 
@@ -895,8 +939,10 @@ def commit_deferred_checkpoints(
     skips that request, and an entry equal to ``state_indices[request, 0]``
     commits in place. It must not equal any of ``state_indices[request, 1:]``,
     which hold that request's records; such a request is refused, not
-    committed. The caller must then treat the request's accepted-token count as
-    one, exactly as it already does after its own state copy.
+    committed. Under ``Caps.external_records`` the records are in the bound
+    ``records`` buffer, a different index space, so there is no such refusal.
+    The caller must then treat the request's accepted-token count as one,
+    exactly as it already does after its own state copy.
     """
     if not isinstance(binding, Binding):
         raise TypeError(f"binding must be Binding, got {type(binding)!r}")

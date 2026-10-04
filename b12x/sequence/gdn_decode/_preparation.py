@@ -73,7 +73,8 @@ def _query_from_caps(caps, invocation):
         max_seqs=caps.max_seqs, max_tokens=caps.max_tokens,
         state_index_columns=caps.state_index_columns, max_state_slots=caps.max_state_slots,
         null_state_index=caps.null_state_index,
-        deferred_checkpoints=caps.deferred_checkpoints, **dict(invocation),
+        deferred_checkpoints=caps.deferred_checkpoints,
+        external_records=caps.external_records, **dict(invocation),
     )
 
 
@@ -86,6 +87,7 @@ def _caps(query, ordinal):
         state_dtype=getattr(torch, query.state_dtype), gate_activation=query.gate_activation,
         qk_l2norm=query.qk_l2norm, null_state_index=query.null_state_index,
         deferred_checkpoints=query.deferred_checkpoints,
+        external_records=query.external_records,
     )
 
 
@@ -145,6 +147,10 @@ def _metadata_binding(query, layout):
         data.update(a=tensor("a", (m, h)), b=tensor("b", (m, h)))
         cls = Binding
     scratch = _TensorMetadata(torch.uint8, (1,), (1,), caps.device, 16)
+    if caps.external_records:
+        data.update(records=_TensorMetadata(
+            torch.float32, (1, caps.record_width), (caps.record_width, 1), caps.device, 16,
+        ))
     return cls(_state=layout, scratch=scratch, **data)
 
 
@@ -283,13 +289,16 @@ class _GdnState:
             raise ValueError("GDN epsilon and scale must be finite and positive")
         if self._kda and (not math.isfinite(lower_bound) or lower_bound >= 0):
             raise ValueError("KDA lower bound must be finite and negative")
-        self.run_tensors(*_binding_tensors(binding), eps=eps, scale=scale, lower_bound=float(lower_bound))
+        self.run_tensors(
+            *_binding_tensors(binding), eps=eps, scale=scale, lower_bound=float(lower_bound),
+            records=getattr(binding, "records", None),
+        )
         return binding.output
 
     def run_tensors(
         self, mixed_qkv, a, b, z, A_log, dt_bias, norm_weight, recurrent_state,
         query_start_loc, num_accepted_tokens, state_indices, num_seqs, num_tokens,
-        output, *, eps, scale, lower_bound,
+        output, *, eps, scale, lower_bound, records=None,
     ):
         self._check((mixed_qkv, a, b, z, A_log, dt_bias, norm_weight, recurrent_state,
                      query_start_loc, num_accepted_tokens, state_indices, num_seqs, num_tokens,
@@ -312,6 +321,7 @@ class _GdnState:
             self.recurrent(
                 mixed_qkv, a, b, A_log, dt_bias, recurrent_state, query_start_loc,
                 num_accepted_tokens, state_indices, num_seqs, output, float(scale),
+                records,
             )
         self.norm[(m * q.value_heads, 1, 1)](
             output, z, norm_weight, num_tokens, float(eps), m,

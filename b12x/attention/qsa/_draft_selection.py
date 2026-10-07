@@ -148,15 +148,10 @@ def _prepare_kernel(
         valid & (column < WIDTH),
         other=-1,
     )
-    tail = start + column - WIDTH
-    value = tl.where(
-        column < WIDTH, original, tl.where(valid & (tail <= position), tail, -1)
-    )
-    tl.store(
-        selected + row * tl.full((), WIDTH + TAIL, tl.int64) + column,
-        value,
-        column < WIDTH + TAIL,
-    )
+    # Rows keep the anchor's WIDTH columns at a WIDTH stride: the planned sparse
+    # program is compiled for that width and strides rows by it. The chain tail
+    # (TAIL only bounds the valid window) is not attended.
+    tl.store(selected + row * tl.full((), WIDTH, tl.int64) + column, original, column < WIDTH)
 
 
 @torch.library.custom_op("b12x::qsa_prepare_draft_selection", mutates_args=("scratch",))
@@ -180,7 +175,7 @@ def prepare_selection(
     selected = _scratch_view(
         scratch,
         offset_bytes=selected_offset,
-        shape=(max_requests, width + tail),
+        shape=(max_requests, width),
         dtype=torch.int32,
     )
     rows = int(query_positions.shape[0])

@@ -3460,9 +3460,11 @@ def test_qsa_run_reuses_draft_anchors_without_mutating_selector_state(
                     assert torch.all(result[2] == 0)
                 if rows == 4:
                     assert torch.all(result[3] == 2)
-                assert binding._draft_work_positions[
-                    0, caps.selection_width :
-                ].tolist() == ([4, 5, -1] if tail_end == 5 else [4, -1, -1])
+                # Anchor columns only, at the planned selection stride (no tail).
+                assert binding._draft_work_positions.shape[1] == caps.selection_width
+                assert torch.equal(
+                    binding._draft_work_positions[0], state.selected_positions[11]
+                )
             positions[0] = 7
             graph.replay()
             assert torch.all(binding._draft_work_positions[0] == -1)

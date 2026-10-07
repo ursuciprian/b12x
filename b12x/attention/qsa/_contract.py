@@ -2044,7 +2044,7 @@ def _bind_materialized(
         _draft_work_positions=_scratch_view(
             scratch_storage,
             offset_bytes=layout.draft_positions_offset_bytes,
-            shape=(caps.max_batch, caps.selection_width + caps.max_speculative_tokens),
+            shape=(caps.max_batch, caps.selection_width),
             dtype=torch.int32,
         )
         if caps.max_speculative_tokens > 0
@@ -3595,6 +3595,18 @@ def _record_draft_anchors(binding: Binding, positions: torch.Tensor) -> None:
         )
 
 
+_DRAFT_REUSE_LOGGED = False
+
+
+def _log_draft_reuse_once(width: int) -> None:
+    """One stderr line per process when draft reuse first runs (arm check: the fix is live)."""
+    global _DRAFT_REUSE_LOGGED
+    if not _DRAFT_REUSE_LOGGED:
+        _DRAFT_REUSE_LOGGED = True
+        import sys
+        print(f"b12x qsa draft reuse: stride fix, read width {width}", file=sys.stderr, flush=True)
+
+
 @torch.library.custom_op("b12x::qsa_attention", mutates_args=("scratch", "output"))
 def _qsa_attention_op(
     plan_handle: int,
@@ -3640,6 +3652,7 @@ def _qsa_attention_op(
     )
     rows, q_heads, head_dim = map(int, query.shape)
     if selected_positions is None:
+        _log_draft_reuse_once(draft_width)
         selected_positions = _scratch_view(
             scratch,
             offset_bytes=draft_positions_offset,
@@ -3769,7 +3782,7 @@ def _run_attention(
         layout.partial_lse_offset_bytes,
         binding.state.config.sparse_gqa_direct_kv_warps,
         layout.draft_positions_offset_bytes if reuse else -1,
-        caps.selection_width + caps.max_speculative_tokens,
+        caps.selection_width,
         caps.max_batch,
     )
     return binding.output[:rows]

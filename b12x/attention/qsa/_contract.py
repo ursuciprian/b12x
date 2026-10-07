@@ -428,12 +428,15 @@ class QsaPrograms:
     support: Mapping[str, object]
     score: object
     sparse: Mapping[str, object]
+    # Draft reuse reads selection + MTP tail (selection_width + max_speculative_tokens
+    # columns, same row stride): its own program, as upstream b631ac19.
+    sparse_draft: Mapping[str, object]
     draft: Mapping[str, object]
 
     def __post_init__(self) -> None:
         objects = (
             *self.support.values(), self.score, *self.sparse.values(),
-            *self.draft.values(),
+            *self.sparse_draft.values(), *self.draft.values(),
         )
         if any(item is None for item in objects):
             raise RuntimeError("QSA preparation did not retain every native executable")
@@ -1271,6 +1274,15 @@ def compile_qsa(
             query=q, key_cache=main_k, value_cache=main_v, request_ids=request_ids,
             selected_positions=selected[:rows], direct_kv_warps=config.sparse_gqa_direct_kv_warps,
         )
+        sparse_draft = sparse
+        if caps.max_speculative_tokens:
+            sparse_draft = compile_sparse_paged_gqa(
+                query=q, key_cache=main_k, value_cache=main_v, request_ids=request_ids,
+                selected_positions=empty(
+                    (rows, caps.selection_width + caps.max_speculative_tokens), torch.int32,
+                ),
+                direct_kv_warps=config.sparse_gqa_direct_kv_warps,
+            )
         draft = {}
         # One complete transaction under the compile context compiles every
         # support program the runtime launches, with the runtime ABI.
@@ -1322,7 +1334,9 @@ def compile_qsa(
             )
         else:
             draft["disabled"] = score
-    return QsaPrograms(support=support, score=score, sparse=sparse, draft=draft)
+    return QsaPrograms(
+        support=support, score=score, sparse=sparse, sparse_draft=sparse_draft, draft=draft,
+    )
 
 
 def plan(
@@ -3595,6 +3609,18 @@ def _record_draft_anchors(binding: Binding, positions: torch.Tensor) -> None:
         )
 
 
+_DRAFT_REUSE_LOGGED = False
+
+
+def _log_draft_reuse_once(width: int) -> None:
+    """One stderr line per process when draft reuse first runs (arm check: the fix is live)."""
+    global _DRAFT_REUSE_LOGGED
+    if not _DRAFT_REUSE_LOGGED:
+        _DRAFT_REUSE_LOGGED = True
+        import sys
+        print(f"b12x qsa draft reuse: full width, read width {width}", file=sys.stderr, flush=True)
+
+
 @torch.library.custom_op("b12x::qsa_attention", mutates_args=("scratch", "output"))
 def _qsa_attention_op(
     plan_handle: int,
@@ -3639,7 +3665,9 @@ def _qsa_attention_op(
         ),
     )
     rows, q_heads, head_dim = map(int, query.shape)
-    if selected_positions is None:
+    draft_reuse = selected_positions is None
+    if draft_reuse:
+        _log_draft_reuse_once(draft_width)
         selected_positions = _scratch_view(
             scratch,
             offset_bytes=draft_positions_offset,
@@ -3688,7 +3716,7 @@ def _qsa_attention_op(
             block_n=BLOCK_N,
             splits=splits,
             direct_kv_warps=direct_kv_warps,
-            _prepared=state.programs.sparse,
+            _prepared=state.programs.sparse_draft if draft_reuse else state.programs.sparse,
         )
 
 

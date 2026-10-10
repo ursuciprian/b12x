@@ -192,8 +192,13 @@ def compile_decode(query_payload, config_payload, ordinal):
                 grid=(triton.cdiv(128, config.recurrent_block_v), n * caps.value_heads),
             )
         else:
-            from ._cute_kernels import _compile
+            from ._cute_kernels import _compile, _compile_commit
             recurrent = _compile(b)[1]
+            if caps.deferred_checkpoints:
+                # The plan owns the deferred commit program, so preparation's
+                # evict_unretained keeps it after the job (the KDA commit is
+                # retained the same way). Runtime lookups share _commit_key.
+                commit = _compile_commit(b)[1]
         norm = kernels._gated_rmsnorm_kernel.warmup(
             b.output, b.z, b.norm_weight, b.num_tokens, 1e-6, b.output.shape[0],
             stride_output_token=b.output.stride(0), stride_output_head=b.output.stride(1),

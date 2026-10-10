@@ -67,9 +67,11 @@ def test_the_knob_stays_out_of_the_selection_key() -> None:
     assert "deferred_checkpoints" not in TUNING.query_fields
     assert TUNING.encode_query(off) == TUNING.encode_query(on)
     # Nothing that feeds the choice digest may move for a default-off knob.
-    assert TUNING.query_schema_version == 4
-    assert TUNING.config_schema_version == 4
-    assert TUNING.candidate_contract_version == 3
+    # Upstream ffabbade moved every tuning schema to 22 (and the candidate
+    # contract to 4); the knob itself still moves none of them.
+    assert TUNING.query_schema_version == 22
+    assert TUNING.config_schema_version == 22
+    assert TUNING.candidate_contract_version == 4
     assert TUNING.config_fields == frozenset({"backend", "recurrent_block_v"})
 
 

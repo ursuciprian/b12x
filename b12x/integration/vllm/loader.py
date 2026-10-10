@@ -1,11 +1,10 @@
-"""Checkpoint loading into ordinary PyTorch CUDA allocations."""
+"""Direct checkpoint loading into managed or device CUDA weight allocations."""
 
 from __future__ import annotations
 
 import dataclasses
 from contextlib import ExitStack
 import heapq
-from importlib.util import find_spec
 import json
 import math
 import sys
@@ -15,29 +14,26 @@ from pathlib import Path
 import torch
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
-from vllm.model_executor.model_loader import weight_utils
-from vllm.model_executor.model_loader.weight_utils import enable_tqdm
+from vllm.model_executor.model_loader.weight_utils import (
+    enable_tqdm,
+    file_source_tensor,
+    safetensors_file_sources,
+)
 
+from b12x.loader import storage_stats
 from b12x.loader._checkpoint import DirectWeightSession
+from b12x.loader._pool import owns_storage, owns_tensor, weight_allocation, weight_pool
 from b12x.loader._progress import CheckpointDisplay
 
 logger = init_logger("vllm.model_executor.model_loader.b12x")
 
 
 class B12xModelLoader(DefaultModelLoader):
-    """Route checkpoint views through an asynchronous read ring or GDS."""
+    """Route checkpoint views into owned weights through CPU direct I/O or GDS."""
 
     def __init__(self, load_config):
-        missing = [name for name in ("file_source_tensor", "safetensors_file_sources")
-                   if not hasattr(weight_utils, name)]
-        if missing:
-            raise RuntimeError("b12x checkpoint loader requires vLLM file-source hooks: "
-                               + ", ".join(missing))
         options = dict(load_config.model_loader_extra_config)
         self.io_threads = options.pop("io_threads", 8)
-        self.read_mode = options.pop("read_mode", "auto")
-        if self.read_mode not in ("auto", "bounce", "gds"):
-            raise ValueError("read_mode must be auto, bounce or gds")
         if options.get("enable_multithread_load"):
             raise ValueError("b12x currently uses synchronous checkpoint routing")
         if load_config.safetensors_load_strategy not in (None, "lazy"):
@@ -57,41 +53,69 @@ class B12xModelLoader(DefaultModelLoader):
     def load_model(self, vllm_config, model_config, prefix=""):
         from vllm.model_executor.weight_transfer import weight_transfer
 
+        if model_config.enable_sleep_mode:
+            raise ValueError("b12x weight allocations do not support vLLM sleep mode")
         device = torch.device(
             self.load_config.device or vllm_config.device_config.device
         )
         if device.type != "cuda":
             raise ValueError("the b12x loader requires a CUDA device")
         index = torch.cuda.current_device() if device.index is None else device.index
+        allocation = weight_allocation(index)
         shared_read_group = None
-        read_mode = self.read_mode
-        if read_mode == "auto":
-            from b12x.loader import capabilities
-
-            read_mode = "bounce" if capabilities(index)["host_page_tables"] else "gds"
-        if read_mode == "gds":
+        if allocation == "device":
             from vllm.distributed.parallel_state import get_tp_group
             from b12x.loader._shared_checkpoint import SharedReadGroup
 
             shared_read_group = SharedReadGroup(get_tp_group().cpu_group, index)
         with (
+            weight_pool(allocation=allocation, device=index) as allocator,
             DirectWeightSession(
-                index, io_threads=self.io_threads,
-                shared_read_group=shared_read_group, read_mode=read_mode,
+                index, io_threads=self.io_threads, allocation_scope=allocator,
+                shared_read_group=shared_read_group,
             ) as session,
-            weight_transfer(session),
+            weight_transfer(session, allocator=allocator),
         ):
             self._session = session
             try:
                 model = super().load_model(vllm_config, model_config, prefix)
                 io_stats = session.stats()
+                shared_runtime_buffers = [
+                    f"{module_name}.{name}".lstrip(".")
+                    for module_name, module in model.named_modules()
+                    for name, buffer in module.named_buffers(recurse=False)
+                    if name in module._non_persistent_buffers_set
+                    and owns_storage(buffer)
+                ]
+                if shared_runtime_buffers:
+                    raise RuntimeError(
+                        "runtime buffers were allocated in shared weight storage: "
+                        + ", ".join(shared_runtime_buffers)
+                    )
             finally:
                 self._session = None
+        torch.cuda.synchronize(device)
+        torch.cuda.empty_cache()
+        parameter_bytes = sum(p.nbytes for p in model.parameters())
+        shared_bytes = sum(p.nbytes for p in model.parameters() if owns_tensor(p))
         model._b12x_loader_storage = {
-            "parameter_bytes": sum(p.nbytes for p in model.parameters()),
+            "allocation": allocation,
+            "parameter_bytes": parameter_bytes,
+            "shared_parameter_bytes": shared_bytes,
+            "shared_runtime_buffers": shared_runtime_buffers,
+            **storage_stats(),
             "io": io_stats,
         }
         logger.debug("b12x O_DIRECT I/O counters: %s", io_stats)
+        logger.debug("b12x allocation audit: no shared non-persistent runtime buffers")
+        logger.debug(
+            "b12x final parameters: %.3f / %.3f GiB in %s weight storage; "
+            "pool backing %.3f GiB",
+            shared_bytes / 2**30,
+            parameter_bytes / 2**30,
+            allocation,
+            storage_stats()["live_bytes"] / 2**30,
+        )
         load_seconds = (
             self.counter_after_loading_weights - self.counter_before_loading_weights
         )
@@ -174,7 +198,7 @@ class B12xModelLoader(DefaultModelLoader):
             weight_map = json.loads(index_path.read_text())["weight_map"]
         indexed_paths = {}
         for path in files:
-            sources = weight_utils.safetensors_file_sources(path)
+            sources = safetensors_file_sources(path)
             file_names = {name for name in sources if source.file_weight_filter(name)}
             resolved_path = Path(path).resolve()
             selected = []
@@ -196,7 +220,7 @@ class B12xModelLoader(DefaultModelLoader):
                 if not should_skip_weight(name, self.local_expert_ids):
                     selected.append(name)
             file_backed = (
-                (source.prefix + name, weight_utils.file_source_tensor(sources[name]))
+                (source.prefix + name, file_source_tensor(sources[name]))
                 for name in selected
                 if name in file_names
             )
@@ -265,10 +289,4 @@ class B12xModelLoader(DefaultModelLoader):
 def register_b12x_loader():
     from vllm.model_executor.model_loader import register_model_loader
 
-    if find_spec("vllm.model_executor.model_loader.b12x_loader") is not None:
-        from vllm.model_executor.model_loader.b12x_loader import (
-            B12xModelLoader as loader_class,
-        )
-    else:
-        loader_class = B12xModelLoader
-    register_model_loader("b12x")(loader_class)
+    register_model_loader("b12x")(B12xModelLoader)

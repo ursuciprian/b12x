@@ -24,10 +24,32 @@ def _decode_query(payload):
     return BlockscaledQuery(**values)
 
 
+# Large-row MXFP8 regime. The M-independent no-hint plan (64x128, BK128) of a wide-N, long-K projection falls off a
+# cliff above ~4K rows on low-SM parts: GB10 K6144 N2560 (Qwen GDN out_proj, attention o_proj) runs 0.26 us/row at
+# M=3024 and 0.60 us/row from M=6048 to 15120, with the large-M unroll on or off. 128x128/BK64 with the persistent
+# swizzle (unroll off) holds ~0.29 us/row from M=4536 to 8192 (1.77 vs 3.64 ms at M=6048) but costs ~0.1 ms more
+# per call at M<=3024. A declaration of >= LARGE_M_ROWS rows gets that plan, and plan_regimes adds a capacity
+# regime of LARGE_M_ROWS - 1 rows (the previous plan) that serves every live M below LARGE_M_ROWS.
+LARGE_M_ROWS = 4096
+_LARGE_M_DENSE = {"mma_tiler_mn": (128, 128), "_tile_k_override": 64, "_large_m_unroll_override": False}
+
+
+def _large_m_shape(query) -> bool:
+    return (
+        query.recipe == "mxfp8" and query.expected_m is None
+        and query.padded_in_features >= 4096 and query.out_features > 1536
+    )
+
+
 def _dense_lowering(query, config, device):
+    from b12x._lib.dense_gemm import _use_low_sm_dense_tactics
     from b12x.gemm._preparation import _default_lowering
     from b12x.gemm._tuning import DenseGemmQuery
     functional = functional_mxfp8_quantization(query, config)
+    large_m = (
+        _large_m_shape(query) and query.num_tokens >= LARGE_M_ROWS
+        and _use_low_sm_dense_tactics(device.identity.sm_count)
+    )
     inner = DenseGemmQuery(
         recipe=query.recipe, entry_point="gemm.blockscaled.mm", weight_storage="native",
         output_dtype="bfloat16", batch=1, max_rows=query.num_tokens,
@@ -35,6 +57,7 @@ def _dense_lowering(query, config, device):
         output_mode="functional" if functional else "provided",
         alpha_mode="unit" if functional else "tensor",
         expected_m=query.expected_m,
+        overrides=FrozenMapping(_LARGE_M_DENSE if large_m else {}),
     )
     return _default_lowering(inner, device.identity)
 
@@ -579,15 +602,17 @@ def plan(query, *, invocation=FrozenMapping(), override=None):
 
 @dataclass(frozen=True)
 class _PackedRegimeState:
-    """Exact static-shape states plus one bounded dynamic-row state."""
+    """Exact static-shape states plus one bounded dynamic-row state (two for a large-row MXFP8 capacity)."""
 
     capacity: _PackedExecutionState
     exact: MappingProxyType
+    small: _PackedExecutionState | None = None
 
     @property
     def required_workspace(self) -> int:
         return max((
             self.capacity.required_workspace,
+            *(() if self.small is None else (self.small.required_workspace,)),
             *(state.required_workspace for state in self.exact.values()),
         ))
 
@@ -598,7 +623,12 @@ class _PackedRegimeState:
                 f"packed execution rows {rows} exceed capacity "
                 f"{self.capacity.query.num_tokens}"
             )
-        return self.exact.get(rows, self.capacity)
+        state = self.exact.get(rows)
+        if state is not None:
+            return state
+        if self.small is not None and rows <= self.small.query.num_tokens:
+            return self.small
+        return self.capacity
 
 
 def plan_regimes(
@@ -624,16 +654,22 @@ def plan_regimes(
         rows: replace(query, num_tokens=rows, expected_m=rows)
         for rows in counts
     }
+    # Live M below LARGE_M_ROWS keeps the previous plan through its own capacity regime (see _dense_lowering).
+    small = LARGE_M_ROWS - 1 if _large_m_shape(query) and query.num_tokens >= LARGE_M_ROWS else None
+    if small is not None:
+        if small in child_queries:
+            raise ValueError(f"exact M {small} collides with the small capacity regime")
+        child_queries[small] = replace(query, num_tokens=small)
     child_queries[query.num_tokens] = query
     children = {
         rows: _plan_bf16(child, invocation=invocation, override=override)
-        for rows, child in child_queries.items()
+        for rows, child in sorted(child_queries.items())
     }
     def assemble(states, device):
         del device
         capacity = states[query.num_tokens]
         exact = MappingProxyType({rows: states[rows] for rows in counts})
-        return _PackedRegimeState(capacity, exact)
+        return _PackedRegimeState(capacity, exact, None if small is None else states[small])
 
     return _CompositePlan(
         component_id="gemm.blockscaled_precision",

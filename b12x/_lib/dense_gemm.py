@@ -521,8 +521,8 @@ def _dense_gemm_policy_for(
         # Capacity regime (no expected_m) declared for >= 4096 rows: the plan
         # vLLM prepares for max_num_batched_tokens serves every prefill chunk.
         # Apply the large-M rule of the expected_m >= 4096 branch below: keep the
-        # 16-way persistent swizzle (unroll off). With unroll on, the K6144 N2560
-        # prefill projections ran 4.7x slower at M=6048 than at M=3024.
+        # 16-way persistent swizzle (unroll off); for wide N the tile selectors
+        # pick 128x128/BK64 for this regime (_capacity_large_m_bk64).
         # Decode exact-M regimes declare expected_m and are unaffected.
         use_large_m_unroll = False
     if (
@@ -7092,6 +7092,8 @@ def _select_default_mma_tiler_mn(
             return (16, 64)
         if m <= 8:
             return (16, 128)
+        if _capacity_large_m_bk64(m, n, k, sm_count):
+            return (128, 128)
         # Wide-N MXFP8: the 128x128 pin spans only ceil(N/128) column tiles, so
         # at small/medium M it launches ~32-64 CTAs and runs flat (~80us, B-BW
         # starved). It is in fact the WORST tile at every M (geomean ~121us over
@@ -7214,6 +7216,21 @@ def _select_default_mma_tiler_mn(
     return coarse_tile
 
 
+def _capacity_large_m_bk64(m: int, n: int, k: Optional[int], sm_count: int) -> bool:
+    """Wide-N MXFP8 capacity regime (no expected_m) declared for >= 4096 rows with K >= 4096 on low-SM parts.
+
+    vLLM declares one such plan per layer for max_num_batched_tokens and runs every prefill chunk through it. The
+    M-independent 64x128/BK128 tile falls off a cliff above ~3K rows there (K6144 N2560 on GB10: 0.26 us/row at
+    M=3024, 0.60 us/row at M=6048..15120, with the large-M unroll on or off); 128x128/BK64 with the persistent swizzle
+    (unroll off, see _dense_gemm_policy_for) stays at ~0.29 us/row from M=4536 to 8192 and costs ~0.1 ms more per call
+    at M<=3024. The tile is keyed on the declared capacity, not on the live M, so one kernel still serves the regime.
+    """
+    return (
+        k is not None and k >= 4096 and n > 1536 and m >= 4096
+        and _use_low_sm_dense_tactics(sm_count)
+    )
+
+
 def _use_high_sm_mxfp8_bk64_prefill(
     expected_m: Optional[int],
     n: int,
@@ -7243,6 +7260,8 @@ def _select_mxfp8_tile_k(
 ) -> int:
     plan_m = expected_m if expected_m is not None else m
     if _use_high_sm_mxfp8_bk64_prefill(expected_m, n, k, sm_count):
+        return 64
+    if expected_m is None and _capacity_large_m_bk64(m, n, k, sm_count):
         return 64
     if (
         expected_m is not None

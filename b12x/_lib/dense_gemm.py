@@ -514,6 +514,20 @@ def _dense_gemm_policy_for(
     if (
         generalize_mxfp8_split_k
         and _use_low_sm_dense_tactics(sm_count)
+        and expected_m is None
+        and m >= 4096
+        and k >= 4096
+    ):
+        # Capacity regime (no expected_m) declared for >= 4096 rows: the plan
+        # vLLM prepares for max_num_batched_tokens serves every prefill chunk.
+        # Apply the large-M rule of the expected_m >= 4096 branch below: keep the
+        # 16-way persistent swizzle (unroll off). With unroll on, the K6144 N2560
+        # prefill projections ran 4.7x slower at M=6048 than at M=3024.
+        # Decode exact-M regimes declare expected_m and are unaffected.
+        use_large_m_unroll = False
+    if (
+        generalize_mxfp8_split_k
+        and _use_low_sm_dense_tactics(sm_count)
         and mma_tiler_mn == (128, 128)
         and tile_k == 64
         and expected_m is not None

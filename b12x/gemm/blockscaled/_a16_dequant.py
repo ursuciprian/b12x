@@ -18,9 +18,9 @@ from __future__ import annotations
 
 import torch
 
-# ponytail: one constant from k96/k100 probe data (crossover below 1264 rows expected); a per-shape table if a second
+# ponytail: one constant from the k100 probe (M=1024 ties the A16 kernel, M=1264 is 1.2x faster); a per-shape table if a second
 # shape ever qualifies with a different crossover.
-MIN_ROWS = 1024
+MIN_ROWS = 1264
 MIN_K = 8192
 MAX_N = 512
 LOW_SM_MAX = 64  # b12x._lib.dense_gemm._DENSE_LOW_SM_MAX_SMS (not imported: it pulls in cutlass)

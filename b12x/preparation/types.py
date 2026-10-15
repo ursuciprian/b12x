@@ -331,16 +331,32 @@ class PreparedCall:
         return result
 
 
+_IN_PREPARATION_CALL: ContextVar[bool] = ContextVar("b12x_preparation_call", default=False)
+
+
+def in_preparation_call() -> bool:
+    """True while a session primes, restores or times a prepared call (never while serving)."""
+    return _IN_PREPARATION_CALL.get()
+
+
+@contextmanager
 def call_scope():
     """The mode prepared calls execute in.
 
     Callers' pools and activations are often inference tensors, which may be
     updated in place only inside inference mode. Materialized resources are
     created outside it so they stay mutable everywhere; the calls that write
-    them run inside it, as serving does.
+    them run inside it, as serving does. ``in_preparation_call`` reports the
+    scope, so an execution path that only serving may take can stay out of
+    selection races.
     """
     import torch
-    return torch.inference_mode()
+    token = _IN_PREPARATION_CALL.set(True)
+    try:
+        with torch.inference_mode():
+            yield
+    finally:
+        _IN_PREPARATION_CALL.reset(token)
 
 
 def _prime(call: PreparedCall):

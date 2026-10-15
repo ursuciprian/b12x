@@ -9,8 +9,9 @@ to BF16: the same math as the A16 kernel up to the order of the FP32 additions, 
 rounding, not byte for byte.
 
 Only the capacity regime of a qualifying query takes it (``engaged``): MXFP8, unpadded K >= 8192, N <= 512, no
-declared exact M, low-SM device. Exact-M (decode) regimes, graph capture, rows below ``MIN_ROWS`` and every other
-shape run the A16 kernel as before. Plan declarations, tuning knobs, queries and workspace sizes are unchanged, so
+declared exact M, low-SM device. Exact-M (decode) regimes, graph capture, preparation calls (priming and selection
+races, so autotune still compares the A16 configs on the kernel), rows below ``MIN_ROWS`` and every other shape run the
+A16 kernel as before. Plan declarations, tuning knobs, queries and workspace sizes are unchanged, so
 plan records and plan population stay the same. torch only: importable without CUDA for the CPU tests.
 """
 from __future__ import annotations
@@ -43,7 +44,8 @@ def unswizzle_scales(scale_bytes: torch.Tensor, n: int, k: int) -> torch.Tensor:
 
 
 def dequantize(values: torch.Tensor, scale_bytes: torch.Tensor) -> torch.Tensor:
-    """MXFP8 [n, k] E4M3 values + F8_128x4 UE8M0 scales -> BF16 [n, k], exact."""
+    """MXFP8 [n, k] E4M3 values + F8_128x4 UE8M0 scales -> BF16 [n, k], exact for quantizer output (a NaN scale byte
+    0xFF gives inf, and E4M3 subnormals under scales below ~2^-124 underflow in BF16; neither comes out of a quantizer)."""
     n, k = values.shape
     scale = torch.exp2(unswizzle_scales(scale_bytes, n, k).float() - 127).to(torch.bfloat16)
     return (values.view(torch.float8_e4m3fn).to(torch.bfloat16).view(n, k // 32, 32) * scale[:, :, None]).view(n, k)

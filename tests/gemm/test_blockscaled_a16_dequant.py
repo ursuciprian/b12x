@@ -54,6 +54,14 @@ def test_engaged_only_for_narrow_long_k_capacity_on_low_sm(query, sms, want):
     assert D.engaged(query, sms) is want
 
 
+def test_preparation_calls_are_flagged_so_races_keep_the_kernel():
+    from b12x.preparation.types import call_scope, in_preparation_call
+    assert not in_preparation_call()
+    with call_scope():
+        assert in_preparation_call() and torch.is_inference_mode_enabled()
+    assert not in_preparation_call()
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_plan_regimes_routes_large_rows_through_bf16_and_keeps_the_kernel_below():
     from b12x.gemm import blockscaled

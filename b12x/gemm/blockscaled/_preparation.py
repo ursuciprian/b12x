@@ -12,6 +12,7 @@ from b12x._lib.scratch import scratch_buffer_spec
 from b12x._lib.utils import current_cuda_stream, cuda_stream_to_int, make_ptr
 from b12x.preparation import FrozenMapping, MemoryRequirements, PersistentMemory, Plan
 from b12x.preparation.types import _CompositePlan
+from . import _a16_dequant
 from ._tuning import (
     BlockscaledConfig, BlockscaledQuery, TUNING, effective_a16_config,
     functional_mxfp8_quantization,
@@ -129,6 +130,7 @@ class _PackedExecutionState:
     required_workspace: int
     workspace: torch.Tensor | None = None
     mxfp8_bases: tuple | None = None
+    a16_dequant: bool = False  # live rows >= _a16_dequant.MIN_ROWS take the BF16 path (see _a16_dequant)
 
     @property
     def owned_nbytes(self) -> int:
@@ -215,6 +217,8 @@ class _PackedExecutionState:
                 if any(_overlap(workspace, tensor) for tensor in (*reads, out)):
                     raise ValueError("workspace must not overlap packed operands/output")
             if config.mode == "a16":
+                if self.a16_dequant and m >= _a16_dequant.MIN_ROWS and not torch.cuda.is_current_stream_capturing():
+                    return _a16_dequant.run(source, values, scale_bytes, out)
                 import cutlass
                 import cutlass.cute as cute
                 _, _, slices = effective_a16_config(q, config)
@@ -330,6 +334,7 @@ def _plan_bf16(query: BlockscaledQuery, *, invocation=FrozenMapping(), override=
             query, config, resolved_device, programs, core,
             dense._cached_alpha_one(resolved_device) if query.recipe == "mxfp8" and config.mode == "a16" else None,
             offsets, needed, workspace, bases,
+            config.mode == "a16" and _a16_dequant.engaged(query, device.identity.sm_count),
         )
 
     return Plan(contract=TUNING, query=query, invocation=invocation, override=override, shared=True,

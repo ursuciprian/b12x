@@ -9529,6 +9529,13 @@ class MoEDynamicKernelBackend:
                         0, fc1_k_tile_cnt if not self.is_w4a8 else 0, 1, unroll=4
                     ):
                         ml_pipeline.producer_acquire(prod_state)
+                        # The MMA warps release a stage while their ldmatrix and
+                        # ld.shared reads of it (generic proxy) can still be in
+                        # flight; the TMA refill writes it through the async
+                        # proxy. Order the released reads before the refill, as
+                        # in the dense GEMM mainloop. Without this fence, M16/M32
+                        # NVFP4 tiles read refilled operands under SM contention.
+                        cute.arch.fence_view_async_shared()
                         cute.copy(
                             tma_a,
                             tAgA_mk[(None, k_tile)],
@@ -9583,6 +9590,8 @@ class MoEDynamicKernelBackend:
                         prod_state.advance()
                         if cutlass.const_expr(self.w4a4_fc1_fused):
                             up_pipeline.producer_acquire(up_prod_state)
+                            # Generic-proxy stage reads before the TMA refill.
+                            cute.arch.fence_view_async_shared()
                             cute.copy(
                                 tma_b_w13,
                                 tBgB_w13_up_nk[(None, k_tile)],
@@ -9621,6 +9630,8 @@ class MoEDynamicKernelBackend:
                             0, fc1_k_tile_cnt if not self.is_w4a8 else 0, 1, unroll=4
                         ):
                             up_pipeline.producer_acquire(up_prod_state)
+                            # Generic-proxy stage reads before the TMA refill.
+                            cute.arch.fence_view_async_shared()
                             cute.copy(
                                 tma_a,
                                 tAgA_mk[(None, k_tile)],
@@ -9671,6 +9682,8 @@ class MoEDynamicKernelBackend:
                         unroll=4,
                     ):
                         phase2_pipeline.producer_acquire(phase2_prod_state)
+                        # Generic-proxy stage reads before the TMA refill.
+                        cute.arch.fence_view_async_shared()
                         cute.copy(
                             tma_b_down,
                             tBgB_down[

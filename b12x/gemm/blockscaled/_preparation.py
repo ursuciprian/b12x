@@ -11,7 +11,7 @@ from b12x._lib.compile_pool import CompileJob
 from b12x._lib.scratch import scratch_buffer_spec
 from b12x._lib.utils import current_cuda_stream, cuda_stream_to_int, make_ptr
 from b12x.preparation import FrozenMapping, MemoryRequirements, PersistentMemory, Plan
-from b12x.preparation.types import _CompositePlan
+from b12x.preparation.types import _CompositePlan, in_preparation_call
 from . import _a16_dequant
 from ._tuning import (
     BlockscaledConfig, BlockscaledQuery, TUNING, effective_a16_config,
@@ -240,7 +240,9 @@ class _PackedExecutionState:
                 if any(_overlap(workspace, tensor) for tensor in (*reads, out)):
                     raise ValueError("workspace must not overlap packed operands/output")
             if config.mode == "a16":
-                if self.a16_dequant and m >= _a16_dequant.MIN_ROWS and not torch.cuda.is_current_stream_capturing():
+                # selection races and priming time the A16 kernel: the BF16 path would tie every A16 config
+                if (self.a16_dequant and m >= _a16_dequant.MIN_ROWS and not torch.cuda.is_current_stream_capturing()
+                        and not in_preparation_call()):
                     return _a16_dequant.run(source, values, scale_bytes, out)
                 import cutlass
                 import cutlass.cute as cute
